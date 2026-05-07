@@ -94,3 +94,13 @@ class FitnessCalculator:
             alpha * child.exploration_score + (1.0 - alpha) * parent.exploration_score
         )
         return child
+
+    def dominant_category(self, category_deltas: dict[str, dict[str, int]]) -> str:
+        """Return the category with the most new transitions."""
+        best = "misc"
+        best_new = -1
+        for cat, d in category_deltas.items():
+            if d.get("new", 0) > best_new:
+                best_new = d["new"]
+                best = cat
+        return best
