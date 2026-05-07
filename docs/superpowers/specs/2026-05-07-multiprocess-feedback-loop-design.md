@@ -68,6 +68,8 @@ class WorkerTask:
     architecture: str = "rkt"
     dive_enable: bool = True
     is_rv32: bool = False
+    allowed_ext_name: str = "base"   # worker 端单例初始化
+    bug_filter_arch: str = "xs"      # worker 端单例初始化
 ```
 
 ### 2.3 WorkerResult — worker 返回的观测数据
@@ -217,7 +219,7 @@ Main Process:
 
 ### 5.4 分数计算与决策
 
-复用现有 `FeedbackSignalExtractor.extract()` + `FeedbackDecisionPolicy.decide()` 两步，关键差异是 delta 来自 snapshot 而非 live corpus：
+分阶段处理：先用 `FeedbackSignalExtractor.extract()` 获取 `exploration_value`，再用 `FitnessCalculator.evaluate()` 计算持久化的 `SeedFitness`，最后用 `FeedbackDecisionPolicy.decide()` 决策。
 
 ```python
 # Step 1: 基于 snapshot 的覆盖 delta（粗粒度 coverage key）
@@ -228,33 +230,70 @@ sync_summary = sync_engine.summary(
     sync_engine.classify([{"family": f, "cov": ""} for f in result.diff_families])
 )
 
-# Step 3: 信号提取（category_deltas 来自 snapshot, rarity 来自 live corpus）
+# Step 3: diff 新颖度（细粒度：区分全新族 vs 已见族）
+diff_delta = corpus.preview_diff_delta(result.diff_families)
+diff_novelty = len(diff_delta["new_families"]) / max(len(set(result.diff_families)), 1) \
+              if result.diff_families else 0.0
+
+# Step 4: 信号提取（category_deltas 来自 snapshot, rarity 来自 live corpus）
 signals = signal_extractor.extract(
     status=result.status,
     failure_kind=result.failure_kind,
     coverage_new_points=delta["new_coverage"],
     coverage_total_points=delta["total_coverage"],
     category_deltas=delta["by_category"],
-    transition_rarities=corpus.get_category_rarities(),   # ← 新增：按类别聚合稀有度
-    diff_novelty_score=(1.0 if result.diff_families else 0.0),
+    transition_rarities=corpus.get_category_rarities(),  # 本次设计首次启用
+    diff_novelty_score=diff_novelty,
     syncable_count=sync_summary["syncable_count"],
 )
-score = signals.exploration_value
 
-# Step 4: 决策
+# Step 5: 适应度计算（激活现有 FitnessCalculator）
+parent_fitness = corpus.get_seed_fitness(task.seed_ref.lineage_parent or "")
+fitness = FitnessCalculator.evaluate(
+    category_deltas=delta["by_category"],
+    diff_families=result.diff_families,
+    exploration_score=signals.exploration_value,
+    lineage_parent=parent_fitness,
+)
+corpus.update_seed_fitness(result.seed_id, fitness)
+
+# Step 6: 种子分数 = exploration_value（用于 scheduler 队列排序）
+score = fitness.exploration_score
+
+# Step 7: 决策
 decision = decision_policy.decide(signals)
-# → promote_mutation (bug_proximity / stable_ancestor)
-# → keep_in_corpus (exploration)
-# → archive_only / discard (不入队)
 ```
 
-`transition_rarities` 参数（之前在所有调用点均为 None）首次被启用：`get_category_rarities()` 按类别聚合 transition 频率，低频类别稀有度更高 → 产生该类覆盖的种子得到更高 `exploration_value`。
+**FitnessCalculator 激活理由**（此前为零调用点死代码）：
+- `category_affinity` 记录种子对各 CSR 类别的贡献比例 → `GoalDirectedScheduler.tag_seed()` 可据此标记种子类别
+- `lineage_depth` 追踪血统代数 → 深层种子说明变异链有效，应优先
+- `novelty_score` 和 `diff_diversity` 持久化到 `campaign_state.json`，跨运行可追踪
 
-### 5.5 RunCorpus 新增方法
+### 5.5 feedback_loop.py 加固
+
+`extract()` 方法当前第 54-57 行直接访问 `delta["total"]` / `delta["new"]`，若数据结构异常会抛 `KeyError`。加固为：
+
+```python
+# Before:
+if delta["total"] > 0:
+    rarity = (transition_rarities or {}).get(cat, 1.0)
+    exploration_value += weight * rarity * (delta["new"] / float(delta["total"]))
+
+# After:
+if delta.get("total", 0) > 0:
+    rarity = (transition_rarities or {}).get(cat, 1.0)
+    exploration_value += weight * rarity * (delta.get("new", 0) / float(delta["total"]))
+```
+
+### 5.6 RunCorpus 新增方法
 
 - `snapshot() -> set[str]` — 返回 `_seen_coverage_points.copy()`
 - `preview_delta_from_snapshot(snapshot: set[str], transitions: list[dict]) -> dict` — 用 `make_coverage_key()` 转换 transitions 为粗粒度 key，对比 snapshot（而非 `_seen_transitions`）计算 delta。返回 `{"new_coverage": N, "total_coverage": N, "by_category": {"privilege": {"new": 2, "total": 3}, ...}}`
 - `get_category_rarities() -> dict[str, float]` — 遍历 `_transition_frequency`，按 key 首段（类别名）分组，取每类别 transition 稀有度均值。返回 `{"privilege": 0.72, "float": 0.85, ...}`
+
+### 5.7 Transition 全量持久化
+
+`dump_campaign_state()` 当前只保存频率 top 1000 的 transition key（`transition_frequency_sample`），低频 transition 在恢复时丢失。本次修改追加 `"transition_keys_full"` 字段，保存完整 `_seen_transitions` 集合，消除有损恢复。
 
 ---
 
@@ -310,15 +349,30 @@ def worker_entry(task: WorkerTask) -> WorkerResult:
     )
 ```
 
-### 6.2 无状态设计
+### 6.2 无状态设计 + Worker 端单例初始化
 
-`worker_generate()` / `worker_mutate()` / `worker_execute()` 全部显式参数，无隐式全局状态依赖（不读 `_divefuzz_config` 全局变量）。
+`worker_generate()` / `worker_mutate()` / `worker_execute()` 全部显式参数，不依赖 `_divefuzz_config` 全局变量。
+
+但 generator 内部有两个模块级单例（`allowed_ext`、`bug_filter`），由 `setup_config()` 在主进程设置。在 Linux `fork` 模式下子进程继承这些单例，但在 `spawn` 模式下会丢失。`worker_entry()` 启动时显式调用一次轻量初始化以确保兼容性：
+
+```python
+def _setup_worker_singletons(allowed_ext_name: str, architecture: str):
+    """Initialize generator module-level singletons inside worker process."""
+    from generator.asm_template_manager.ext_list import allowed_ext
+    from generator.bug_filter import bug_filter
+    allowed_ext.setup_ext(allowed_ext_name)
+    bug_filter.set_architecture(architecture)
+```
+
+`WorkerTask` 新增两个字段：`allowed_ext_name: str`、`bug_filter_arch: str`（纯字符串，pickle 安全）。
 
 `arch`（ArchConfig）是 picklable dataclass，可安全跨进程传递。
 
-### 6.3 Observe 文件隔离
+### 6.3 Observe 文件隔离与清理
 
 每个种子独立路径：`difftest.observe.{seed_id}.jsonl`，避免多 worker 并发写入冲突。
+
+worker 解析 observation 后立即删除 observe 文件（数据已提取到 WorkerResult），避免磁盘膨胀。
 
 ---
 
@@ -332,13 +386,18 @@ def worker_entry(task: WorkerTask) -> WorkerResult:
 {
   "coverage_points": ["control|csrrs", "privilege|csrrw"],
   "transition_keys": {"privilege|...|csrrs:0x342": 3},
+  "transition_keys_full": ["privilege|...|csrrs:0x342", "float|...|fadd.s:0x53", ...],
   "diff_family_counts": {"fp_rounding": 2},
-  "seed_fitness": {"000001": {"exploration_score": 0.8}},
+  "seed_fitness": {"000001": {"exploration_score": 0.8, "category_affinity": {...}, ...}},
   "signatures": ["exec|executed|none|..."],
   "last_seed_id": 42,
   "total_iterations": 150
 }
 ```
+
+- `transition_keys`（频率 top 1000）保留用于快速预览和调试
+- `transition_keys_full`（新增）保存完整 `_seen_transitions` 集合，消除跨运行有损恢复
+- `seed_fitness` 首次在运行时被 `FitnessCalculator` 填充（此前只在 bootstrap 时反序列化）
 
 **queue_state.json**（新增）：
 
@@ -383,16 +442,19 @@ def worker_entry(task: WorkerTask) -> WorkerResult:
 |------|------|------|
 | `fuzzer/core/seed_ref.py` | **新建** | SeedRef, WorkerTask, WorkerResult dataclass |
 | `fuzzer/core/scheduler.py` | **修改** | ScheduledSeed → SeedRef; 三队列 deque → heapq; 新增 pop_best(); 新增 dump/restore |
-| `fuzzer/executor/worker.py` | **新建** | worker_entry(), worker_generate(), worker_mutate(), worker_execute() |
-| `fuzzer/executor/dut_executor.py` | **修改** | _run_dut_tests_with_feedback() → Manager-Worker 调度循环; 新增 evaluate_and_feedback() |
-| `fuzzer/run_dut.py` | **修改** | 加载 queue_state.json; 保存 scheduler dump; 传递 emu_cmd/emu_path 给 WorkerTask |
-| `fuzzer/tests/test_feedback_loop.py` | **更新** | ScheduledSeed → SeedRef 适配; 新增 pop_best 测试 |
+| `fuzzer/core/corpus.py` | **修改** | 新增 snapshot(), preview_delta_from_snapshot(), get_category_rarities(); dump_campaign_state 追加 transition_keys_full |
+| `fuzzer/core/fitness.py` | **修改** | 激活 FitnessCalculator（5d 打分时调用 evaluate + update_lineage） |
+| `fuzzer/core/feedback_loop.py` | **修改** | extract() 加固 .get() 防御 KeyError |
+| `fuzzer/executor/worker.py` | **新建** | worker_entry(), _setup_worker_singletons(), worker_generate(), worker_mutate(), worker_execute() |
+| `fuzzer/executor/dut_executor.py` | **修改** | _run_dut_tests_with_feedback() → Manager-Worker 调度循环 |
+| `fuzzer/run_dut.py` | **修改** | 加载 queue_state.json; 保存 scheduler dump; 传递完整参数给 WorkerTask |
+| `fuzzer/tests/test_feedback_loop.py` | **更新** | ScheduledSeed → SeedRef 适配; 新增 pop_best、snapshot delta、FitnessCalculator 测试 |
 
 ### 不变部分
 
-- `generator/` 目录完全不碰
+- `generator/` 目录完全不碰（worker 函数通过现有公开 API 调用）
 - `run_divefuzz()` / `run_divefuzz_single()` 不删除（向后兼容）
-- `observation.py`、`feedback_loop.py`、`sync.py`、`corpus.py`、`fitness.py` 逻辑不变
+- `sync.py`、`observation.py` 逻辑不变
 - `config/` 结构不变
 
 ---
@@ -401,7 +463,10 @@ def worker_entry(task: WorkerTask) -> WorkerResult:
 
 1. `seed_ref.py` — 三个 dataclass，纯数据，无依赖
 2. `scheduler.py` — ScheduledSeed → SeedRef, heapq, pop_best, dump/restore
-3. `worker.py` — 从 divefuzz_adapter.py 抽取无状态 worker 函数
-4. `dut_executor.py` — 新调度循环替换 _run_dut_tests_with_feedback
-5. `run_dut.py` — 加载/保存 queue_state，传参适配
-6. 测试更新 — 适配新类型，新增 pop_best 测试
+3. `corpus.py` — 新增 snapshot(), preview_delta_from_snapshot(), get_category_rarities(); dump_campaign_state 追加 transition_keys_full
+4. `feedback_loop.py` — extract() 加固 .get()
+5. `fitness.py` — 确保 FitnessCalculator.evaluate() 对接新数据流（调整参数签名如需）
+6. `worker.py` — 从 divefuzz_adapter.py 抽取无状态 worker 函数 + 单例初始化
+7. `dut_executor.py` — 新调度循环替换 _run_dut_tests_with_feedback
+8. `run_dut.py` — 加载/保存 queue_state，传参适配
+9. 测试更新 — 适配新类型，新增 pop_best、snapshot delta、FitnessCalculator 测试
