@@ -1,29 +1,29 @@
 # CLAUDE.md — DiveFuzz + RVFUZZ 反馈回路
 
-## Architecture docs
-- `docs/divefuzz-architecture-exploration.md` — 完整架构 (原始 + RVFUZZ 植入)
-- `docs/rvfuzz-feedback-implantation.md` — 植入点映射 + 文件变更清单
+## Architecture
+- **Manager-Worker 批量模式**: 主进程持有 corpus/scheduler, ProcessPoolExecutor worker 池 (M = dut_config.threads) 并行 gen→exec→observe
+- `docs/divefuzz-architecture-exploration.md` — 完整架构
+- `docs/superpowers/specs/2026-05-07-multiprocess-feedback-loop-design.md` — 多进程设计 spec
+- `docs/superpowers/plans/2026-05-07-multiprocess-feedback-loop-plan.md` — 实现计划
 
-## Dual-path execution
-- 默认走 `_run_dut_tests_with_feedback()` (RVFUZZ P0-P8 闭环)
-- 不传 feedback dict 时回退 `_run_dut_tests_original()` (原始批处理)
+## Execution paths
+- `_run_dut_tests_with_feedback()` — Manager-Worker 批量闭环 (默认)
+- `_run_dut_tests_original()` — 原始批处理 (无 feedback dict 时回退)
 
 ## Key directories
-- `fuzzer/core/` — RVFUZZ 反馈回路 (observation, sync, scheduler, feedback_loop, corpus, fitness, status)
-- `fuzzer/config/` — 配置解析 (dut_config, divefuzz_config, logger_config)
-- `fuzzer/executor/` — DUT 测试执行 (dut_executor, divefuzz_adapter)
-- `fuzzer/generator/` — 原装未修改 (XOR 去重, HybridEncoder, BugFilter, 模板)
-- `fuzzer/tests/test_feedback_loop.py` — 22 个集成测试
-- `configs/rocket_feedback.yaml` — 反馈回路配置示例
+- `fuzzer/core/` — 反馈回路 (seed_ref, scheduler, corpus, feedback_loop, fitness, observation, sync, status)
+- `fuzzer/executor/` — DUT 执行 (dut_executor: 调度循环, worker: 无状态 worker 函数, divefuzz_adapter)
+- `fuzzer/generator/` — 原装未修改
+- `fuzzer/tests/test_feedback_loop.py` — 34 个集成测试
 
 ## Run
 ```bash
-cd fuzzer && python run_dut.py --config ../configs/rocket_feedback.yaml
+# Must run from repo root with PYTHONPATH=. (all imports use fuzzer. prefix)
+PYTHONPATH=. python fuzzer/run_dut.py --config configs/rocket_feedback.yaml
 ```
 
 ## Test
 ```bash
-# Run from repo root — PYTHONPATH must include repo root for `from fuzzer.core...` imports
 PYTHONPATH=. python -m pytest fuzzer/tests/test_feedback_loop.py -v
 ```
 
@@ -32,6 +32,10 @@ PYTHONPATH=. python -m pytest fuzzer/tests/test_feedback_loop.py -v
 - 需要 SPIKE_HOME / riscv64-unknown-elf-* toolchain / pip install -r requirements.txt
 
 ## Key invariants
-- core/ 组件通过 duck-typed dict/object 兼容层与 generator 交互
-- batch_size 控制反馈回路迭代次数 (非种子批量大小)
-- PYTHONPATH 须指向仓库根目录 (非 fuzzer/)，代码使用 `from fuzzer.core...` 导入
+- **Import rule**: 所有跨目录导入必须用 `from fuzzer.xxx` 前缀, 混用 `from config.x` 和 `from fuzzer.config.x` 会导致 isinstance 失败 (Python 当作不同模块)
+- batch_size 控制反馈回路 batch 轮数; dut_config.threads 控制 worker 池大小 M
+- **Paths**: 传给 worker 的路径必须 `.resolve()` 转绝对路径 (worker 的 CWD 与主进程不同)
+- **Seed path**: `{corpus_dir}/seeds/{seed_id}/img_file/seed_0.img`
+- **Observe files**: worker 使用 `difftest.observe.{seed_id}.jsonl` 隔离, 解析后自动删除
+- generator/ 不修改, worker 通过显式参数调用现有 API
+- **Mutation**: DiveFuzz 原生 mutator 在指令分布均匀时产生空序列, 需足够复杂程序才能成功变异
