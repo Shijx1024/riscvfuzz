@@ -27,3 +27,8 @@ def dump_json(data: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(to_primitive(data), f, ensure_ascii=False, indent=2)
+
+
+def load_json(path: Path) -> Any:
+    """Load and parse a JSON file. Returns parsed Python object."""
+    return json.loads(path.read_text(encoding="utf-8"))
