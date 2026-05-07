@@ -302,8 +302,8 @@ def _run_dut_tests_with_feedback(config: Config, config_filename: str,
     fitness_calc = FitnessCalculator()
 
     M = max(1, config.dut_target.threads)
-    output_dir = (Path(config.corpus_dir) / "seeds" if config.corpus_dir
-                  else Path("outputs") / "seeds")
+    output_dir = ((Path(config.corpus_dir) / "seeds").resolve() if config.corpus_dir
+                  else Path("outputs").resolve() / "seeds")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract seed config params

@@ -61,7 +61,14 @@ def worker_generate(
     elf_dir.mkdir(parents=True, exist_ok=True)
     process_file(str(asm_files[0].name), str(gen_dir), str(img_dir), str(elf_dir))
 
-    return img_dir / "seed_0.img"
+    # Find generated .img and rename to canonical seed_0.img
+    img_files = list(img_dir.glob("*.img"))
+    if not img_files:
+        raise RuntimeError(f"No .img file generated in {img_dir}")
+    canonical = img_dir / "seed_0.img"
+    if img_files[0] != canonical:
+        img_files[0].rename(canonical)
+    return canonical
 
 
 def worker_mutate(
@@ -109,7 +116,13 @@ def worker_mutate(
     elf_dir.mkdir(parents=True, exist_ok=True)
     process_file(str(asm_outputs[0].name), str(mutate_output), str(img_dir), str(elf_dir))
 
-    return img_dir / "seed_0.img"
+    img_files = list(img_dir.glob("*.img"))
+    if not img_files:
+        raise RuntimeError(f"No .img file generated in {img_dir}")
+    canonical = img_dir / "seed_0.img"
+    if img_files[0] != canonical:
+        img_files[0].rename(canonical)
+    return canonical
 
 
 def worker_execute(
@@ -124,6 +137,7 @@ def worker_execute(
         command = command + observe_flag
 
     start = time.monotonic()
+    observe_path = Path(emu_path) / observe_rel
     try:
         proc = subprocess.run(
             command, shell=True, cwd=emu_path, text=True,
@@ -142,7 +156,7 @@ def worker_execute(
             "duration_s": duration,
             "failure_kind": failure_kind,
             "message": proc.stdout[-500:] if proc.stdout else "",
-            "observation_path": Path(emu_path) / observe_rel,
+            "observation_path": observe_path,
         }
     except subprocess.TimeoutExpired:
         return {
@@ -204,7 +218,6 @@ def worker_entry(task: WorkerTask) -> WorkerResult:
     obs_path = exec_data.get("observation_path")
     if obs_path is not None and obs_path.exists():
         obs = parse_observation(obs_path)
-        # Clean up -- data already extracted
         try:
             obs_path.unlink()
         except OSError:

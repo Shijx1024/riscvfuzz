@@ -16,12 +16,12 @@
 import argparse
 import sys
 from pathlib import Path
-from config.logger_config import get_global_logger, create_output_dir
-from config.dut_config import Config
-from executor.dut_executor import run_dut_tests
-from core.corpus import RunCorpus
-from core.scheduler import GoalDirectedScheduler
-from core.feedback_loop import FeedbackSignalExtractor, FeedbackDecisionPolicy
+from fuzzer.config.logger_config import get_global_logger, create_output_dir
+from fuzzer.config.dut_config import Config
+from fuzzer.executor.dut_executor import run_dut_tests
+from fuzzer.core.corpus import RunCorpus
+from fuzzer.core.scheduler import GoalDirectedScheduler
+from fuzzer.core.feedback_loop import FeedbackSignalExtractor, FeedbackDecisionPolicy
 
 
 def main():
