@@ -17,11 +17,14 @@ import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 import glob
-from config.logger_config import create_test_logger
-from config.dut_config import Config, DUTTarget, DirSeedConfig, GeneratedSeedConfig, SeedConfigBase
-from executor.divefuzz_adapter import setup_divefuzz, run_divefuzz, run_divefuzz_single
-from utils.results_reporter import TestResult, ResultType, format_duration, generate_result_report, generate_summary_report
+from fuzzer.config.logger_config import create_test_logger
+from fuzzer.config.dut_config import Config, DUTTarget, DirSeedConfig, GeneratedSeedConfig, SeedConfigBase
+from fuzzer.executor.divefuzz_adapter import setup_divefuzz, run_divefuzz, run_divefuzz_single, run_divefuzz_mutate
+from fuzzer.utils.results_reporter import TestResult, ResultType, format_duration, generate_result_report, generate_summary_report
+from fuzzer.core.seed_ref import SeedRef, WorkerTask, WorkerResult
+from fuzzer.core.status import CaseStatus, FailureKind
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +32,34 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# RVFUZZ helper functions — seed ID allocation, bundle construction
+# ---------------------------------------------------------------------------
+
+
+def _build_bundle(seed_ref: SeedRef, result: WorkerResult,
+                  execute_result: Any) -> dict[str, Any]:
+    """Build a corpus-compatible bundle dict from typed worker data."""
+    from fuzzer.core.observation import make_coverage_key
+    points = {make_coverage_key(t) for t in result.transitions}
+    return {
+        "case_id": result.seed_id,
+        "seed": seed_ref.seed_id,
+        "lineage_parent": seed_ref.lineage_parent,
+        "status": result.status,
+        "coverage_result": {"points": points, "status": "collected"},
+        "execute_result": execute_result,
+        "feedback_decision": None,
+    }
+
+
+def _allocate_seed_id(corpus: Any) -> str:
+    """Allocate next sequential seed_id."""
+    next_id = getattr(corpus, '_next_seed_id', 0) + 1
+    corpus._next_seed_id = next_id
+    return f"{next_id:06d}"
 
 
 def run_single_seed(seed_path: str, seed_name: str, dut_config: DUTTarget, seed_config_name: str, test_logger: logging.Logger) -> TestResult:
@@ -251,205 +282,236 @@ def _run_dut_tests_original(config: Config, config_filename: str) -> list[TestRe
 
 
 # ---------------------------------------------------------------------------
-# RVFUZZ Feedback Loop — implanted into DiveFuzz control flow
+# RVFUZZ Feedback Loop — Manager-Worker batch loop (multiprocess implant)
 # ---------------------------------------------------------------------------
 
 def _run_dut_tests_with_feedback(config: Config, config_filename: str,
                                  feedback: dict) -> list[TestResult]:
-    """Feedback-guided fuzzing loop (RVFUZZ implant).
-
-    P1: scheduler.pop_next() drives generation parameters
-    P2: run_divefuzz_single() generates one seed
-    P3: run_single_seed_with_observation() executes + captures observer data
-    P4: extract_csr_transitions + classify_diff_family + SyncDecisionEngine
-    P5: FeedbackSignalExtractor + FeedbackDecisionPolicy
-    P6: mutate_instructions (DiveFuzz native) when promote_mutation
-    P7: scheduler.update_saturation + scheduler.push
-    """
-    from fuzzer.core.observation import extract_csr_transitions, classify_diff_family
+    """Manager-Worker batch fuzzing loop (RVFUZZ multiprocess implant)."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     from fuzzer.core.sync import SyncDecisionEngine
-    from fuzzer.core.scheduler import ScheduledSeed
+    from fuzzer.core.fitness import FitnessCalculator
+    from fuzzer.model.result import ExecuteResult
+    from fuzzer.executor.worker import worker_entry
 
     corpus = feedback["corpus"]
     scheduler = feedback["scheduler"]
     signal_extractor = feedback["signal_extractor"]
     decision_policy = feedback["decision_policy"]
+    sync_engine = SyncDecisionEngine()
+    fitness_calc = FitnessCalculator()
 
-    # P1: Initialize seed queue from config
-    for seed_config in config.seeds:
-        if isinstance(seed_config, GeneratedSeedConfig):
-            setup_divefuzz(seed_config, global_logger=logger)
-            scheduler.push(ScheduledSeed(
-                seed=seed_config.name,
-                queue="exploration",
-                lineage_parent=f"seed:{seed_config.name}",
-                params={
-                    "instr_number": seed_config.divefuzz.ins_num,
-                    "architecture": seed_config.divefuzz.architecture,
-                    "template_type": seed_config.divefuzz.template_type,
-                    "dive_enable": seed_config.divefuzz.dive_enable,
-                    "is_rv32": seed_config.divefuzz.is_rv32,
-                    "seeds_output": seed_config.divefuzz.seeds_output,
-                }
-            ))
+    M = max(1, config.dut_target.threads)
+    output_dir = (Path(config.corpus_dir) / "seeds" if config.corpus_dir
+                  else Path("outputs") / "seeds")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[RVFUZZ] Feedback loop initialized. "
-                f"Batch size: {config.batch_size}, "
-                f"Scheduler seeds: {len(scheduler)}")
+    # Extract seed config params
+    seed_config = config.seeds[0]
+    if not isinstance(seed_config, GeneratedSeedConfig):
+        logger.error("Feedback loop requires a GeneratedSeedConfig")
+        return []
 
-    total_results = []
-    index = 0
+    setup_divefuzz(seed_config, global_logger=logger)
+    from fuzzer.executor.divefuzz_adapter import _divefuzz_config
+    arch = _divefuzz_config.arch
+    allowed_ext_name = _divefuzz_config.allowed_ext_name
+    instr_number = seed_config.divefuzz.ins_num
+    template_type = seed_config.divefuzz.template_type
+    architecture = seed_config.divefuzz.architecture
+    dive_enable = seed_config.divefuzz.dive_enable
+    is_rv32 = seed_config.divefuzz.is_rv32
 
-    while index < config.batch_size:
-        scheduled = scheduler.pop_next()
-        if scheduled is None:
-            logger.info(f"[RVFUZZ] Scheduler exhausted after {index} iterations")
-            break
-
-        seed_params = getattr(scheduled, 'params', {}) if hasattr(scheduled, 'params') else {}
-        instr_number = seed_params.get("instr_number", 200)
-        architecture = seed_params.get("architecture", "rkt")
-        template_type = seed_params.get("template_type", "rocket")
-        dive_enable = seed_params.get("dive_enable", True)
-        is_rv32 = seed_params.get("is_rv32", False)
-        seeds_output = seed_params.get("seeds_output", "outputs")
-
-        logger.info(f"[RVFUZZ] Iteration {index}: seed={scheduled.seed}, "
-                    f"queue={scheduled.queue}, instr={instr_number}")
-
-        # P2: Single seed generation via DiveFuzz
-        try:
-            seed_files = run_divefuzz_single(
-                out_dir=seeds_output,
+    # --- Warmup ---
+    if len(scheduler) == 0:
+        logger.info("[RVFUZZ] Scheduler empty — warmup generating %d seeds", M)
+        for _ in range(M):
+            sid = _allocate_seed_id(corpus)
+            scheduler.push(SeedRef(sid, "exploration", score=0.5, action="generate"))
+        warmup_batch = scheduler.pop_best(M)
+        warmup_tasks = [
+            WorkerTask(
+                seed_ref=ref,
+                output_dir=output_dir,
+                emu_cmd=config.dut_target.cmd,
+                emu_path=config.dut_target.emu_path,
+                arch=arch,
                 instr_number=instr_number,
                 template_type=template_type,
                 architecture=architecture,
-                eliminate_enable=dive_enable,
+                dive_enable=dive_enable,
                 is_rv32=is_rv32,
-                seed_index=index,
+                allowed_ext_name=allowed_ext_name,
+                bug_filter_arch=architecture,
             )
-        except Exception as exc:
-            logger.error(f"[RVFUZZ] Generation failed for iteration {index}: {exc}")
-            index += 1
-            continue
+            for ref in warmup_batch
+        ]
+        with ProcessPoolExecutor(max_workers=M) as pool:
+            futures = {pool.submit(worker_entry, t): t for t in warmup_tasks}
+            warmup_results = [fut.result() for fut in as_completed(futures)]
+        # Build result map
+        warmup_result_map = {r.seed_id: r for r in warmup_results}
+        snapshot = corpus.snapshot()
+        for task in warmup_tasks:
+            result = warmup_result_map.get(task.seed_ref.seed_id)
+            if result is None:
+                continue
+            _evaluate_and_enqueue(
+                task, result, corpus, scheduler, signal_extractor,
+                decision_policy, sync_engine, fitness_calc, snapshot,
+            )
 
-        if not seed_files:
-            logger.warning(f"[RVFUZZ] No seed files generated for iteration {index}")
-            index += 1
-            continue
+    # --- Main loop ---
+    total_iter = 0
+    while total_iter < config.batch_size and len(scheduler) > 0:
+        snapshot = corpus.snapshot()
 
-        seed_path = seed_files[0]
+        # Fill queue if needed
+        if len(scheduler) < M:
+            needed = M - len(scheduler)
+            for _ in range(needed):
+                sid = _allocate_seed_id(corpus)
+                scheduler.push(SeedRef(sid, "exploration", score=0.5, action="generate"))
 
-        # P3: Execute + capture observation
-        result = run_single_seed_with_observation(
-            seed_path=seed_path,
-            seed_name=f"{scheduled.seed}_{index}",
-            dut_config=config.dut_target,
-            seed_config_name=config_filename,
-        )
+        batch = scheduler.pop_best(M)
+        logger.info("[RVFUZZ] Batch %d: dispatching %d seeds", total_iter, len(batch))
 
-        # P3: Extract CSR transitions and diff families from observer output
-        observe_path = getattr(result, 'observation_path', None)
-        transitions = extract_csr_transitions(observe_path) if observe_path else []
-        diff_families = classify_diff_family(observe_path) if observe_path else []
+        tasks = [
+            WorkerTask(
+                seed_ref=ref,
+                output_dir=output_dir,
+                emu_cmd=config.dut_target.cmd,
+                emu_path=config.dut_target.emu_path,
+                arch=arch,
+                instr_number=instr_number,
+                template_type=template_type,
+                architecture=architecture,
+                dive_enable=dive_enable,
+                is_rv32=is_rv32,
+                allowed_ext_name=allowed_ext_name,
+                bug_filter_arch=architecture,
+            )
+            for ref in batch
+        ]
 
-        # Sync decision engine
-        sync_engine = SyncDecisionEngine()
-        diff_events = [{"family": f, "cov": ""} for f in diff_families]
-        sync_decisions = sync_engine.classify(diff_events)
-        sync_summary = sync_engine.summary(sync_decisions)
+        with ProcessPoolExecutor(max_workers=M) as pool:
+            futures = {pool.submit(worker_entry, t): t for t in tasks}
+            results = []
+            for fut in as_completed(futures):
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    task = futures[fut]
+                    logger.error("[RVFUZZ] Worker failed for seed %s: %s",
+                                 task.seed_ref.seed_id, exc)
+                    scheduler.push(SeedRef(task.seed_ref.seed_id, "exploration",
+                                           0.1, action=task.seed_ref.action))
 
-        # Build a dict-based bundle for corpus (duck-typed to match CaseBundle interface)
-        status_str = {
-            ResultType.SUCCESS: "executed",
-            ResultType.FAILURE: "diff_failed",
-            ResultType.TIMEOUT: "timeout",
-            ResultType.ERROR: "infra_error",
-        }.get(result.result_type, "infra_error")
+        result_map = {r.seed_id: r for r in results}
 
-        bundle = {
-            "case_id": f"case-{index:06d}",
-            "seed": scheduled.seed,
-            "lineage_parent": scheduled.lineage_parent,
-            "status": status_str,
-            "coverage_result": {"points": set(), "status": "collected"},
-            "execute_result": type('obj', (object,), {
-                "observation_coverage_points": [],
-                "observation_counts": {},
-                "duration_s": getattr(result, 'duration_s', 0.0),
-                "diff_families": diff_families,
-                "syncable_count": sync_summary["syncable_count"],
-                "potential_bug_count": sync_summary["potential_bug_count"],
-            })(),
-            "coverage_new_points": 0,
-            "coverage_total_points": 0,
-            "coverage_delta_ratio": 0.0,
-            "feedback_decision": "archive_only",
-        }
+        # First pass: score against snapshot
+        for task in tasks:
+            result = result_map.get(task.seed_ref.seed_id)
+            if result is None:
+                continue
+            _evaluate_and_enqueue(
+                task, result, corpus, scheduler, signal_extractor,
+                decision_policy, sync_engine, fitness_calc, snapshot,
+            )
 
-        # P4: Coverage delta
-        coverage_delta = corpus.preview_coverage_delta(bundle)
-        has_new = coverage_delta.get("new_points", 0) > 0
+        # Persist
+        persist_dir = output_dir.parent
+        corpus.dump_campaign_state(persist_dir / "campaign_state.json")
+        scheduler.dump_queue(persist_dir / "queue_state.json")
+        total_iter += 1
 
-        if not has_new and coverage_delta.get("total_points", 0) > 0:
-            logger.info(f"[RVFUZZ] No new coverage — archiving")
-            corpus.record(bundle)
-            total_results.append(result)
-            index += 1
-            continue
+    logger.info("[RVFUZZ] Feedback loop complete. Iterations: %d", total_iter)
+    return []
 
-        # P4: Signal extraction
-        signals = signal_extractor.extract(
-            status=status_str,
-            failure_kind=(result.summary if result.result_type != ResultType.SUCCESS else None),
-            coverage_new_points=int(coverage_delta.get("new_points", 0)),
-            coverage_total_points=int(coverage_delta.get("total_points", 0)),
-            duration_s=getattr(result, 'duration_s', 0.0),
-            diff_novelty_score=(1.0 if diff_families else 0.0),
-            syncable_count=sync_summary["syncable_count"],
-        )
 
-        # P5: Decision
-        decision = decision_policy.decide(signals)
-        bundle["feedback_decision"] = decision.decision
-        logger.info(f"[RVFUZZ] Decision: {decision.decision} "
-                    f"queue={decision.queue} score={decision.score:.2f} "
-                    f"exploration={signals.exploration_value:.3f}")
+def _evaluate_and_enqueue(
+    task: WorkerTask, result: WorkerResult, corpus, scheduler,
+    signal_extractor, decision_policy, sync_engine, fitness_calc,
+    snapshot: set[str],
+) -> None:
+    """Score a single result against snapshot, update corpus, re-enqueue."""
+    from fuzzer.model.result import ExecuteResult
 
-        # P7: Update scheduler saturation
-        if diff_families and any(f not in getattr(corpus, '_seen_diff_signatures', {})
-                                 for f in diff_families):
-            corpus._seen_diff_signatures.update(diff_families)
+    delta = corpus.preview_delta_from_snapshot(snapshot, result.transitions)
 
-        # P6: Mutation — promote_mutation triggers DiveFuzz mutation
-        if decision.decision == "promote_mutation" and seed_files:
-            logger.info(f"[RVFUZZ] Triggering mutation for seed {scheduled.seed}")
-            # Push mutated variant to scheduler for next round
-            scheduler.push(ScheduledSeed(
-                seed=f"mut-{scheduled.seed}-{index}",
-                queue=decision.queue if decision.queue in (
-                    "bug_proximity", "stable_ancestor", "exploration"
-                ) else "stable_ancestor",
-                lineage_parent=f"seed:{scheduled.seed}",
-                params=seed_params,
-            ))
+    # Sync classification
+    sync_summary = sync_engine.summary(
+        sync_engine.classify([{"family": f, "cov": ""} for f in result.diff_families])
+    )
 
-        # P7: Push next exploration seed
-        scheduler.push(ScheduledSeed(
-            seed=f"gen-{index+1:06d}",
-            queue="exploration",
-            lineage_parent=f"seed:{scheduled.seed}",
-            params=seed_params,
-        ))
+    # Diff novelty
+    diff_delta = corpus.preview_diff_delta(result.diff_families)
+    diff_novelty = (len(diff_delta["new_families"]) /
+                    max(len(set(result.diff_families)), 1)
+                    if result.diff_families else 0.0)
 
-        # Record in corpus
-        corpus.record(bundle)
-        total_results.append(result)
-        index += 1
+    # Signal extraction
+    signals = signal_extractor.extract(
+        status=result.status,
+        failure_kind=result.failure_kind,
+        coverage_new_points=delta["new_coverage"],
+        coverage_total_points=delta["total_coverage"],
+        category_deltas=delta["by_category"],
+        transition_rarities=corpus.get_category_rarities(),
+        diff_novelty_score=diff_novelty,
+        syncable_count=sync_summary["syncable_count"],
+    )
 
-    logger.info(f"[RVFUZZ] Feedback loop complete. "
-                f"Iterations: {index}, Corpus entries: {len(corpus.entries)}")
-    return total_results
+    # Fitness
+    parent_fitness = corpus.get_seed_fitness(task.seed_ref.lineage_parent or "")
+    fitness = fitness_calc.evaluate(
+        seed=result.seed_id,
+        category_deltas=delta["by_category"],
+        diff_families=result.diff_families,
+        exploration_value=signals.exploration_value,
+        lineage_depth=parent_fitness.get("lineage_depth", 0) + 1 if isinstance(parent_fitness, dict) else 0,
+    )
+    corpus.update_seed_fitness(result.seed_id, fitness)
+
+    # Tag seed for GoalDirectedScheduler
+    dom_cat = fitness_calc.dominant_category(delta["by_category"])
+    scheduler.tag_seed(result.seed_id, dom_cat)
+    scheduler.update_saturation(delta["by_category"])
+
+    # Record to corpus
+    corpus.record_transitions(result.transitions)
+    if result.diff_families:
+        corpus.record_diff_families(result.diff_families, result.seed_id)
+
+    exec_result = ExecuteResult(
+        case_id=result.seed_id,
+        status=result.status,
+        csr_transitions=result.transitions,
+        diff_families=result.diff_families,
+        syncable_count=sync_summary["syncable_count"],
+        potential_bug_count=sync_summary["potential_bug_count"],
+    )
+    bundle = _build_bundle(task.seed_ref, result, exec_result)
+    decision = decision_policy.decide(signals)
+    bundle["feedback_decision"] = decision.decision
+    corpus.record(bundle)
+
+    score = fitness.exploration_score
+
+    # Re-enqueue based on decision
+    if decision.decision == "promote_mutation":
+        scheduler.push(SeedRef(result.seed_id, decision.queue, score,
+                               lineage_parent=result.seed_id,
+                               action=task.seed_ref.action))
+        # Schedule mutation for next batch
+        mutated_id = _allocate_seed_id(corpus)
+        scheduler.push(SeedRef(mutated_id, "stable_ancestor", score,
+                               lineage_parent=result.seed_id, action="mutate"))
+    elif decision.decision == "keep_in_corpus":
+        scheduler.push(SeedRef(result.seed_id, "exploration", score,
+                               lineage_parent=result.seed_id,
+                               action=task.seed_ref.action))
+    # archive_only / discard → not re-enqueued
 
 
 def run_single_seed_with_observation(
@@ -458,13 +520,27 @@ def run_single_seed_with_observation(
 ) -> TestResult:
     """Run a single seed and capture difftest observation output.
 
-    Extends run_single_seed() by resolving the observe_path from the
-    DUT command's working directory and attaching it to the result.
+    Extends run_single_seed() by:
+    - Appending --rvfuzz-observe / --rvfuzz-observe-level to the emu command
+    - Resolving the observe_path from the DUT working directory and
+      attaching it to the result.
     """
-    result = run_single_seed(seed_path, seed_name, dut_config, seed_config_name, logger)
+    observe_rel = getattr(dut_config, 'observe_path', '') or 'difftest.observe.jsonl'
+    observe_level = getattr(dut_config, 'observe_level', '') or 'all'
+
+    # Append rvfuzz-observe flags to the emu command so the emulator
+    # writes observation JSONL during execution.
+    original_cmd = dut_config.cmd
+    observe_flag = f" --rvfuzz-observe={observe_rel} --rvfuzz-observe-level={observe_level}"
+    if "--rvfuzz-observe=" not in original_cmd:
+        dut_config.cmd = original_cmd + observe_flag
+
+    try:
+        result = run_single_seed(seed_path, seed_name, dut_config, seed_config_name, logger)
+    finally:
+        dut_config.cmd = original_cmd
 
     # Resolve observation path from DUT working directory
-    observe_rel = getattr(dut_config, 'observe_path', '') or 'difftest.observe.jsonl'
     observe_path = Path(dut_config.emu_path) / observe_rel
     if observe_path.exists():
         result.observation_path = observe_path

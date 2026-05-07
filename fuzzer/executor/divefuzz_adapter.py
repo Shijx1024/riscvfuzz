@@ -15,13 +15,13 @@
 import os
 from pathlib import Path
 import subprocess
-from config.dut_config import GeneratedSeedConfig
+from fuzzer.config.dut_config import GeneratedSeedConfig
 
-from config.divefuzz_config import DiveFuzzArgConfig
-from generator.core.mutator import mutate_instructions_parallel
-from utils.elf_to_img import process_assembly_files
-from generator.core.generator import generate_instructions_parallel
-from generator.config.config_manager import setup_config
+from fuzzer.config.divefuzz_config import DiveFuzzArgConfig
+from fuzzer.generator.core.mutator import mutate_instructions_parallel
+from fuzzer.utils.elf_to_img import process_assembly_files
+from fuzzer.generator.core.generator import generate_instructions_parallel
+from fuzzer.generator.config.config_manager import setup_config
 
 # Module-level variable to store the Config object
 _divefuzz_config = None
@@ -114,11 +114,18 @@ def run_divefuzz_single(out_dir: str, instr_number: int = 200,
     """Generate a single seed and return the list of .img file paths.
 
     Uses the globally-configured _divefuzz_config (set by setup_divefuzz).
-    All generation parameters are passed explicitly.
+    Each call writes to a unique subdirectory (iter_{seed_index}) to avoid
+    overwriting seeds from other iterations.
     """
     global _divefuzz_config
     if _divefuzz_config is None:
         raise RuntimeError("setup_divefuzz() must be called before run_divefuzz_single()")
+
+    # Resolve to absolute path so the generated .img paths are valid
+    # regardless of the emulator's working directory.
+    from pathlib import Path as _Path
+    base_dir = _Path(out_dir).resolve()
+    generator_output_dir = base_dir / f"iter_{seed_index:06d}"
 
     generate_instructions_parallel(
         instr_number=instr_number,
@@ -128,13 +135,11 @@ def run_divefuzz_single(out_dir: str, instr_number: int = 200,
         max_workers=1,
         arch=_divefuzz_config.arch,
         template_type=template_type,
-        out_dir=str(out_dir),
+        out_dir=str(generator_output_dir),
         architecture=architecture,
     )
 
     # Convert .S -> .elf -> .img
-    from pathlib import Path as _Path
-    generator_output_dir = _Path(out_dir)
     process_assembly_files(str(generator_output_dir))
 
     img_dir = generator_output_dir / 'img_file'
@@ -148,6 +153,82 @@ def run_divefuzz_single(out_dir: str, instr_number: int = 200,
 
     return seed_files
         
+
+
+def run_divefuzz_mutate(seed_path: str, out_dir: str,
+                        eliminate_enable: bool = True,
+                        is_rv32: bool = False,
+                        architecture: str = "rkt",
+                        template_type: str = "rocket") -> list:
+    """Mutate an existing seed and return the list of mutated .img file paths.
+
+    Locates the .S assembly file corresponding to the given .img seed,
+    runs DiveFuzz instruction-level mutation, and returns the resulting
+    .img files.
+    """
+    global _divefuzz_config
+    if _divefuzz_config is None:
+        raise RuntimeError("setup_divefuzz() must be called before run_divefuzz_mutate()")
+
+    from pathlib import Path as _Path
+    import shutil
+
+    img_path = _Path(seed_path).resolve()
+    if not img_path.exists():
+        return []
+
+    # Locate the .S assembly file: img_file/seed_0.img → asm_file/seed_0.S
+    img_dir = img_path.parent
+    asm_dir = img_dir.parent / "asm_file"
+    asm_name = img_path.stem + ".S"
+    asm_path = asm_dir / asm_name
+    if not asm_path.exists():
+        # Fallback: search recursively
+        asm_path = None
+        for f in img_dir.parent.rglob("*.S"):
+            if f.stem == img_path.stem:
+                asm_path = f
+                break
+        if asm_path is None:
+            return []
+
+    # Set up mutation workspace
+    mutate_workspace = _Path(out_dir).resolve() / "mutate_work" / img_path.stem
+    mutate_input = mutate_workspace / "input"
+    mutate_output = mutate_workspace / "output"
+    mutate_input.mkdir(parents=True, exist_ok=True)
+    mutate_output.mkdir(parents=True, exist_ok=True)
+
+    # Copy .S file to mutation input directory
+    shutil.copy2(str(asm_path), str(mutate_input / asm_name))
+
+    # Run mutation
+    from generator.core.mutator import mutate_instructions_parallel
+    mutate_instructions_parallel(
+        directory_path=mutate_input,
+        mutate_directory=mutate_output,
+        max_workers=1,
+        enable_ext=False,
+        exclude_extensions=[],
+        eliminate_enable=eliminate_enable,
+        arch=_divefuzz_config.arch,
+        template_type=template_type,
+    )
+
+    # Convert .S → .img
+    process_assembly_files(str(mutate_output))
+
+    # Collect mutated .img files
+    img_output_dir = mutate_output / "img_file"
+    if not img_output_dir.exists():
+        return []
+
+    seed_files = []
+    for file in os.listdir(img_output_dir):
+        if file.endswith(".img"):
+            seed_files.append(os.path.join(img_output_dir, file))
+
+    return seed_files
 
 
 def process_divefuzz_asm(seed_config: GeneratedSeedConfig, seed_config_logger):

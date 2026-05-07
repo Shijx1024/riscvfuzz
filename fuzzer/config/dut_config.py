@@ -15,7 +15,7 @@ import yaml
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Union, Dict
-from config.logger_config import get_global_logger
+from fuzzer.config.logger_config import get_global_logger
 
 
 config_logger = get_global_logger(__name__)
