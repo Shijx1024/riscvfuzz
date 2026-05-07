@@ -37,5 +37,4 @@ PYTHONPATH=. python -m pytest fuzzer/tests/test_feedback_loop.py -v
 - **Paths**: 传给 worker 的路径必须 `.resolve()` 转绝对路径 (worker 的 CWD 与主进程不同)
 - **Seed path**: `{corpus_dir}/seeds/{seed_id}/img_file/seed_0.img`
 - **Observe files**: worker 使用 `difftest.observe.{seed_id}.jsonl` 隔离, 解析后自动删除
-- generator/ 不修改, worker 通过显式参数调用现有 API
 - **Mutation**: DiveFuzz 原生 mutator 在指令分布均匀时产生空序列, 需足够复杂程序才能成功变异
