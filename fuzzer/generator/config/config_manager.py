@@ -86,9 +86,9 @@ class Config:
         self.debug_log_csr = not bool(args.debug_no_csr)
         self.debug_log_fpr = not bool(args.debug_no_fpr)
 
-        self.stateful_xor_cache = bool(args.stateful_xor_cache)
-        self.bug_filter_enable = bool(args.bug_filter_enable)
-        self.jump_enable = bool(args.jump_enable)
+        # self.stateful_xor_cache = bool(args.stateful_xor_cache)
+        # self.bug_filter_enable = bool(args.bug_filter_enable)
+        # self.jump_enable = bool(args.jump_enable)
 
         self.arch_bits = 32 if self.is_rv32 else 64
 

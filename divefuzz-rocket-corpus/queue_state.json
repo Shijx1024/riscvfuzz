@@ -1,0 +1,24 @@
+{
+  "bug_proximity": [],
+  "exploration": [
+    {
+      "seed_id": "000003",
+      "score": 0.0,
+      "lineage_parent": "000003",
+      "action": "generate"
+    },
+    {
+      "seed_id": "000001",
+      "score": 0.0,
+      "lineage_parent": "000001",
+      "action": "generate"
+    },
+    {
+      "seed_id": "000002",
+      "score": 0.0,
+      "lineage_parent": "000002",
+      "action": "generate"
+    }
+  ],
+  "stable_ancestor": []
+}

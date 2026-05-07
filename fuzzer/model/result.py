@@ -12,7 +12,6 @@ class ExecuteResult:
     exit_code: int | None = None
     command: list[str] = field(default_factory=list)
     reference_name: str = ""
-    duration_s: float = 0.0
     failure_kind: str | None = None
     message: str = ""
     observation_path: Path | None = None

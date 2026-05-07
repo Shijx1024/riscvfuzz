@@ -1,96 +1,15 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fuzzer.core.status import CaseStatus
 
-
-def _status_of(bundle: Any) -> str:
-    if bundle.execute_result is not None:
-        return bundle.execute_result.status.value
-    if bundle.generate_result is not None:
-        return bundle.generate_result.status.value
-    return "pending"
-
-
-def _failure_kind_of(bundle: Any) -> str | None:
-    if bundle.execute_result is not None and bundle.execute_result.failure_kind is not None:
-        return bundle.execute_result.failure_kind.value
-    if bundle.generate_result is not None and bundle.generate_result.failure_kind is not None:
-        return bundle.generate_result.failure_kind.value
-    return None
-
-
-def _message_of(bundle: Any) -> str:
-    if bundle.execute_result is not None:
-        return bundle.execute_result.message
-    if bundle.generate_result is not None:
-        return bundle.generate_result.message
-    return ""
-
-
-def _failure_signature_id(status: str, failure_kind: str | None, message: str) -> str:
-    raw = f"{status}|{failure_kind or 'none'}|{message.strip()}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _build_metrics(
-    status: str,
-    duration_s: float,
-    coverage_point_count: int,
-    coverage_new_points: int,
-    coverage_delta_ratio: float,
-    difftest_unique_events: int,
-    difftest_total_events: int,
-    unique_pc_pages: int,
-) -> dict[str, float]:
-    if coverage_point_count > 0:
-        coverage_delta_score = max(coverage_delta_ratio, 1.0 if coverage_new_points > 0 else 0.0)
-        rare_coverage_score = min(1.0, 0.2 + coverage_delta_ratio)
-    else:
-        coverage_delta_score = 0.0
-        rare_coverage_score = 0.0
-    diff_novelty_score = 1.0 if status == CaseStatus.DIFF_FAILED.value else 0.0
-    behavior_novelty_score = 1.0 if status in {
-        CaseStatus.DIFF_FAILED.value,
-        CaseStatus.BADTRAP.value,
-        CaseStatus.REFERENCE_FAILED.value,
-        CaseStatus.TIMEOUT.value,
-    } else 0.0
-    event_diversity = min(1.0, difftest_unique_events / 8.0)
-    page_diversity = min(1.0, unique_pc_pages / 16.0)
-    event_volume = min(1.0, (math.log2(max(1, difftest_total_events))) / 8.0)
-    state_novelty_score = min(1.0, 0.5 * event_diversity + 0.3 * page_diversity + 0.2 * event_volume)
-    execution_cost_score = min(1.0, duration_s / 60.0)
-    failure_severity_score = _severity_of(status)
-
-    return {
-        "coverage_delta_score": coverage_delta_score,
-        "rare_coverage_score": rare_coverage_score,
-        "diff_novelty_score": diff_novelty_score,
-        "behavior_novelty_score": behavior_novelty_score,
-        "state_novelty_score": state_novelty_score,
-        "execution_cost_score": execution_cost_score,
-        "failure_severity_score": failure_severity_score,
-    }
-
-
-def _severity_of(status: str) -> float:
-    if status == CaseStatus.DIFF_FAILED.value:
-        return 1.0
-    if status in {CaseStatus.BADTRAP.value, CaseStatus.REFERENCE_FAILED.value}:
-        return 0.9
-    if status in {CaseStatus.TIMEOUT.value, CaseStatus.COVERAGE_FAILED.value}:
-        return 0.6
-    if status in {CaseStatus.GENERATION_FAILED.value, CaseStatus.INVALID_PROGRAM.value, CaseStatus.INFRA_ERROR.value}:
-        return 0.4
-    if status == CaseStatus.EXECUTED.value:
-        return 0.0
-    return 0.2
+@dataclass
+class ObservationData:
+    transitions: list[dict[str, Any]]
+    diff_families: list[str]
 
 
 CSR_CATEGORIES: dict[str, set[str]] = {
@@ -110,14 +29,42 @@ CSR_CATEGORIES: dict[str, set[str]] = {
                   "mhpmevent28", "mhpmevent29", "mhpmevent30", "mhpmevent31"},
 }
 
-_CSR_WRITE_INSTRS = {"csrw", "csrwi", "csrs", "csrc", "csrsi", "csrci"}
-
-
 def _category_for(csr_name: str) -> str:
     for category, names in CSR_CATEGORIES.items():
         if csr_name in names:
             return category
     return "misc"
+
+
+CSR_WRITE_MNEMONICS: set[str] = {"csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrci"}
+
+TRIVIAL_CSR_CATEGORIES: set[str] = {"privilege", "float"}
+
+
+def make_coverage_key(transition: dict[str, Any]) -> str:
+    """Build a category-level coverage key: {category}|{mnemonic}.
+
+    Unlike _serialize_transition (which includes actual CSR register values),
+    this produces coarse-grained keys suitable for coverage dedup across
+    different programs that exercise the same CSR category with the same
+    instruction type.
+    """
+    category = transition.get("category", "misc")
+    instr = transition.get("instr", "")
+    mnemonic = instr.split(":")[0] if ":" in instr else instr
+    return f"{category}|{mnemonic}"
+
+
+def _is_trivial_csr_write(mnemonic: str, category: str) -> bool:
+    """Return True if this is a trivial CSR-write transition that should be filtered.
+
+    Filter rationale (from ProcessorFuzz): CSR-write instructions (csrrw/csrrs/
+    csrrc/csrrwi/csrrsi/csrci) that modify a commonly-written CSR register
+    produce their primary intended effect. The interesting coverage signal comes
+    from *side effects* — non-CSR instructions that happen to alter CSR state
+    (e.g. FP ops modifying fflags, traps changing mcause).
+    """
+    return mnemonic in CSR_WRITE_MNEMONICS and category in TRIVIAL_CSR_CATEGORIES
 
 
 def classify_transition(csr_name: str) -> str:
@@ -129,53 +76,49 @@ def _serialize_transition(csr: str, prev_value: str, curr_value: str, instr: str
 
 
 def _parse_cov_field(cov: str) -> tuple[str, str, str, str] | None:
-    """Parse a cov field like 'csr:mstatus:0x0000000a00000000->0x0000000a00001800:csrw'
-    into (csr_name, prev_value, curr_value, instr_mnemonic)."""
-    parts = cov.split(":")
-    if len(parts) < 4 or parts[0] != "csr":
-        return None
-    csr_name = parts[1]
-    transition = parts[2]
-    instr = parts[3] if len(parts) > 3 else "unknown"
-    if "->" not in transition:
-        return None
-    prev_str, curr_str = transition.split("->", 1)
-    prev_clean = prev_str.replace("0x", "").strip()
-    curr_clean = curr_str.replace("0x", "").strip()
-    if not prev_clean or not curr_clean:
-        return None
-    if prev_clean == curr_clean:
-        return None
-    return (csr_name, prev_clean, curr_clean, instr)
+    """Parse a cov field into (category, prev_vec, curr_vec, instr_tag).
 
+    Emulator format (difftest.cpp):
+      csr:{category}:{mnemonic}:{addr}:{vec_before}->{vec_after}
 
-def _is_trivial_csr_write(
-    csr_name: str,
-    prev_state: dict[str, str],
-    curr_state: dict[str, str],
-    instr: str,
-) -> bool:
-    """A CSR write is trivial if the instruction targets this CSR and
-    no other CSR changed value."""
-    if instr not in _CSR_WRITE_INSTRS:
-        return False
-    changed_csrs = {
-        name for name in set(prev_state) | set(curr_state)
-        if prev_state.get(name, "") != curr_state.get(name, "")
-    }
-    return changed_csrs == {csr_name}
+    Examples:
+      csr:priv:csrrs:0x342:0x800...00,0x0,...->0x800...00,0x2,...
+      csr:priv:opc:0x73:0x800...00,0x0,...->0x800...80,0x2,...
+
+      → ("privilege", "0x800...00,0x0,...", "0x800...00,0x2,...", "csrrs:0x342")
+
+    Category mapping: "priv" → "privilege", "float" → "float"
+    """
+    if not cov.startswith("csr:"):
+        return None
+    content = cov[4:]  # strip "csr:" prefix
+    parts = content.split(":", 3)  # category, mnemonic, addr, rest
+    if len(parts) < 4:
+        return None
+    category_raw, mnemonic, addr, rest = parts
+    if "->" not in rest:
+        return None
+    prev_str, curr_str = rest.split("->", 1)
+    prev_vec = prev_str.strip()
+    curr_vec = curr_str.strip()
+    if not prev_vec or not curr_vec:
+        return None
+    if prev_vec == curr_vec:
+        return None
+    category = "privilege" if category_raw == "priv" else category_raw
+    instr_tag = f"{mnemonic}:{addr}"
+    return (category, prev_vec, curr_vec, instr_tag)
 
 
 def extract_csr_transitions(observation_path: Path | None) -> list[dict[str, Any]]:
-    """Extract CSR transition triples from a DiffTest JSONL observation file.
+    """Extract CSR transition vectors from a DiffTest JSONL observation file.
 
-    Returns list of dicts with keys: csr, prev_value, curr_value, instr, category.
-    Filters trivial CSR-write transitions where only the target CSR changed.
+    Returns list of dicts with keys: csr (category), prev_value, curr_value, instr, category.
+    The emulator (difftest.cpp) already filters trivial CSR-write transitions.
     """
     if observation_path is None or not observation_path.exists():
         return []
     transitions: list[dict[str, Any]] = []
-    csr_state: dict[str, str] = {}
     try:
         fp = observation_path.open("r", encoding="utf-8", errors="ignore")
     except OSError:
@@ -198,31 +141,18 @@ def extract_csr_transitions(observation_path: Path | None) -> list[dict[str, Any
             parsed = _parse_cov_field(cov.strip())
             if parsed is None:
                 continue
-            csr_name, prev_clean, curr_clean, instr = parsed
-            if csr_name in csr_state and _is_trivial_csr_write(csr_name, csr_state, {csr_name: curr_clean}, instr):
+            category, prev_vec, curr_vec, instr_tag = parsed
+            mnemonic = instr_tag.split(":")[0] if ":" in instr_tag else instr_tag
+            if _is_trivial_csr_write(mnemonic, category):
                 continue
-            csr_state[csr_name] = curr_clean
-            category = _category_for(csr_name)
             transitions.append({
-                "csr": csr_name,
-                "prev_value": prev_clean,
-                "curr_value": curr_clean,
-                "instr": instr,
+                "csr": category,
+                "prev_value": prev_vec,
+                "curr_value": curr_vec,
+                "instr": instr_tag,
                 "category": category,
             })
     return transitions
-
-
-def build_transition_cooccurrence(transitions: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
-    """Stub for Plan 5: instruction-transition co-occurrence matrix.
-    Returns empty dict until full implementation."""
-    return {}
-
-
-def extract_transition_paths(transitions: list[dict[str, Any]], window: int = 2) -> list[str]:
-    """Stub for Plan 6: sliding-window transition path coverage.
-    Returns empty list until full implementation."""
-    return []
 
 
 DIFF_FAMILIES: dict[str, str] = {
@@ -325,3 +255,60 @@ def classify_diff_family(observation_path: Path | None) -> list[str]:
             family = _classify_single_diff(payload)
             families.append(family)
     return families
+
+
+def parse_observation(observation_path: Path | None) -> ObservationData:
+    """Single-pass parse of a DiffTest JSONL observation file.
+
+    Extracts both CSR transitions and diff family classifications in one
+    file scan, avoiding the double I/O of calling extract_csr_transitions()
+    and classify_diff_family() separately.
+    """
+    if observation_path is None or not observation_path.exists():
+        return ObservationData(transitions=[], diff_families=[])
+
+    transitions: list[dict[str, Any]] = []
+    diff_families: list[str] = []
+
+    try:
+        fp = observation_path.open("r", encoding="utf-8", errors="ignore")
+    except OSError:
+        return ObservationData(transitions=[], diff_families=[])
+    with fp:
+        for line in fp:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            event = str(payload.get("event", ""))
+
+            # --- coverage events: CSR transitions ---
+            if event == "coverage":
+                cov = payload.get("cov")
+                if isinstance(cov, str) and cov.strip():
+                    parsed = _parse_cov_field(cov.strip())
+                    if parsed is not None:
+                        category, prev_vec, curr_vec, instr_tag = parsed
+                        mnemonic = instr_tag.split(":")[0] if ":" in instr_tag else instr_tag
+                        if _is_trivial_csr_write(mnemonic, category):
+                            continue
+                        transitions.append({
+                            "csr": category,
+                            "prev_value": prev_vec,
+                            "curr_value": curr_vec,
+                            "instr": instr_tag,
+                            "category": category,
+                        })
+
+            # --- error/mismatch events: diff families ---
+            else:
+                severity = str(payload.get("severity", "")).lower()
+                if severity in {"error", "fatal"} or event.lower() == "mismatch":
+                    family = _classify_single_diff(payload)
+                    diff_families.append(family)
+
+    return ObservationData(transitions=transitions, diff_families=diff_families)

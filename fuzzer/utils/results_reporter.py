@@ -92,7 +92,6 @@ class TestResult:
         self.summary = summary
         self.log_path = log_path
         self.observation_path = None
-        self.duration_s = 0.0
 
 
 def generate_report_block(content_lines, color):

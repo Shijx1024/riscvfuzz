@@ -2,33 +2,6 @@
 
 DiveFuzz is a diversified instruction generation approach designed specifically for RISC-V CPUs. Its core idea is to drive testing through dynamically diversified instruction write-back values, enabling effective exploration of CPU states. More details can be found in the [paper](https://dl.acm.org/doi/10.1145/3719027.3765167). In addition, the project is under active development and will continue to incorporate new extensions and features.
 
-
-## Get Start
-
-
-Clone the main repository
-
-```
-git clone https://github.com/In2Sec/DiveFuzz
-cd DiveFuzz
-```
-
-Clone the runtime-diversified version of riscv-isa-sim adapted for DiveFuzz as a `git submodule`
-
-```
-git submodule init ref/riscv-isa-sim-adapter
-git submodule update ref/riscv-isa-sim-adapter
-```
-
-Navigate to the dut directory and select your target RISC-V CPU for testing. **If you already have the target existing, you can skip this step.**
-
-```
-cd dut
-
-# Example: XiangShan
-git submodule init XiangShan
-```
-
 ## Requirements
 
 ### RISC-V toolchain
@@ -190,20 +163,3 @@ DiveFuzz implements a three-tier logging system
 3. **Per-seed execution logs**  
    Stored at: `outputs/{configuration_file}-{seed_profile_name}_{seed_basename}.log`, like `outputs/your_test-divefuzz_ins_10_seed_0_.elf.log`
 
-
-
-
-## Affiliation
-
-This project is developed by the Institute of Information Engineering, Chinese Academy of Sciences (CAS).
-
-## Citation
-```
-@inproceedings{guo2025divefuzz,
-  title={DiveFuzz: Enhancing CPU Fuzzing via Diverse Instruction Construction},
-  author={Guo, Zihui and Yuan, Miaomiao and Yang, Yanqi and Chen, Liwei and Shi, Gang and Meng, Dan},
-  booktitle={Proceedings of the 2025 ACM SIGSAC Conference on Computer and Communications Security},
-  pages={1964--1978},
-  year={2025}
-}
-```

@@ -1,0 +1,120 @@
+{
+  "initial_corpus": [],
+  "total_recorded": 7,
+  "queue_size": 1,
+  "archive_only_count": 6,
+  "dedup_signature_count": 1,
+  "coverage_point_count": 1,
+  "consumed_seeds": [
+    "000001",
+    "000002",
+    "000001",
+    "000002",
+    "000003",
+    "000001",
+    "000002"
+  ],
+  "retained_seeds": [
+    "000001"
+  ],
+  "entries": [
+    {
+      "case_id": "000001",
+      "seed": "000001",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "promote_mutation",
+      "queue": "stable_ancestor",
+      "lineage_parent": "seed:000001",
+      "manifest_path": "",
+      "coverage_new_points": 1,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 1.0
+    },
+    {
+      "case_id": "000002",
+      "seed": "000002",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "seed:000002",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    },
+    {
+      "case_id": "000001",
+      "seed": "000001",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "000001",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    },
+    {
+      "case_id": "000002",
+      "seed": "000002",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "000002",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    },
+    {
+      "case_id": "000003",
+      "seed": "000003",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "000001",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    },
+    {
+      "case_id": "000001",
+      "seed": "000001",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "000001",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    },
+    {
+      "case_id": "000002",
+      "seed": "000002",
+      "status": "executed",
+      "failure_kind": null,
+      "signature": "exec|executed|none||none",
+      "decision": "archive_only",
+      "queue": "exploration",
+      "lineage_parent": "000002",
+      "manifest_path": "",
+      "coverage_new_points": 0,
+      "coverage_total_points": 1,
+      "coverage_delta_ratio": 0.0
+    }
+  ]
+}

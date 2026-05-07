@@ -1,0 +1,52 @@
+# Rocket + RVFUZZ Feedback Loop — Integration Test Config
+# Usage: cd learn/DiveFuzz/fuzzer && python run_dut.py --config ../configs/rocket_feedback.yaml
+#
+# Prerequisites:
+#   1. Rocket emu built at dut/rocket-chip/build/emu
+#   2. SPIKE_HOME (or 'spike' env var) pointing to DiveFuzz-modified Spike
+#   3. riscv64-unknown-elf-* toolchain in PATH
+
+# --- DUT Target ---
+# List with exactly one element (DiveFuzz convention)
+dut_target:
+  - name: rocket
+    version: "latest"
+    diff_ref: "spike"
+    emu_path: /home/shijunxu/riscwuzz/RVFUZZ/learn/DiveFuzz/dut/rocket-chip
+    cmd: "SPIKE_HOME=/home/shijunxu/riscwuzz/RVFUZZ/ref/riscv-isa-sim ./build/emu -i $1"
+    threads: 2
+    # RVFUZZ feedback: observer output path (relative to emu_path)
+    observe_path: "difftest.observe.jsonl"
+    observe_level: "all"
+
+# --- Seed Configuration ---
+seeds:
+  - name: rocket-fb-test
+    input: divefuzz
+    divefuzz:
+      mode: generate
+      gen_only: false
+      threads: 1
+      # Enable Spike XOR duplicate elimination
+      dive_enable: true
+      # Output directory for generated seeds
+      seeds_output: divefuzz-rocket-out
+      # Rocket-specific template (header/footer with trap vectors, MSTATUS init)
+      template_type: rocket
+      # Architecture for bug filtering: rkt (Rocket)
+      architecture: rkt
+      # Basic RISC-V extension profile
+      allowed_ext_name: base
+      # Single seed per iteration (feedback loop controls total count)
+      seeds_num: 1
+      ins_num: 200
+      is_rv32: false
+
+# --- RVFUZZ Feedback Loop ---
+campaign_id: rocket-feedback-test
+# Total iterations (each iteration: scheduler.pop → generate → execute → observe → decide → mutate)
+batch_size: 5
+# Maximum seeds retained in RunCorpus
+corpus_max_retained: 100
+# Cross-run persistence directory
+corpus_dir: divefuzz-rocket-corpus

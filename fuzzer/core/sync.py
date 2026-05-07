@@ -4,22 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-def emit_morph_event(pc: str, orig_inst: str, mutated_inst: str, cycle: int, instr: int) -> dict[str, Any]:
-    return {"event": "morph", "pc": pc, "orig_inst": orig_inst,
-            "mutated_inst": mutated_inst, "cycle": cycle, "instr": instr}
-
-
-def emit_sync_event(sync_type: str, target: str, dut_value: str, ref_value: str,
-                    reason: str, pc: str, cycle: int, instr: int) -> dict[str, Any]:
-    return {"event": "sync", "type": sync_type, "target": target,
-            "dut_value": dut_value, "ref_value": ref_value,
-            "reason": reason, "pc": pc, "cycle": cycle, "instr": instr}
-
-
-def emit_strategy_event(strategy: str, seed: str) -> dict[str, Any]:
-    return {"event": "morph_strategy", "strategy": strategy, "seed": seed}
-
-
 @dataclass
 class SyncDecision:
     family: str
