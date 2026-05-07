@@ -161,34 +161,53 @@ Main Process:
      tasks = [WorkerTask(ref, ...) for ref in batch]
      results = pool.map(worker_entry, tasks)
 
-     # 5d. 第一遍：基于 snapshot 公平打分
+     # 5d. 第一遍：基于 snapshot 公平打分 + 暂存决策
      for task, result in zip(batch, results):
          delta = corpus.preview_delta_from_snapshot(snapshot, result.transitions)
-         score = compute_score(delta)
-         task.seed_ref.score = score
+         sync_summary = sync_engine.summary(
+             sync_engine.classify([{"family": f, "cov": ""} for f in result.diff_families])
+         )
+         signals = signal_extractor.extract(
+             status=result.status,
+             failure_kind=result.failure_kind,
+             coverage_new_points=delta["new_coverage"],
+             coverage_total_points=delta["total_coverage"],
+             category_deltas=delta["by_category"],
+             transition_rarities=corpus.get_category_rarities(),
+             diff_novelty_score=(1.0 if result.diff_families else 0.0),
+             syncable_count=sync_summary["syncable_count"],
+         )
+         task._score = signals.exploration_value
+         task._decision = decision_policy.decide(signals)
 
-     # 5e. 第二遍：更新全局 corpus
+     # 5e. 第二遍：更新全局 corpus（顺序无关排序，所有结果都记录）
      for task, result in zip(batch, results):
          corpus.record_transitions(result.transitions)
+         if result.diff_families:
+             corpus.record_diff_families(result.diff_families, result.seed_id)
+         scheduler.update_saturation(delta["by_category"])
          bundle = build_bundle(task.seed_ref, result)
          corpus.record(bundle)
 
-     # 5f. 第三遍：种子重新入队
+     # 5f. 第三遍：按决策入队
      for task, result in zip(batch, results):
-         if has_new_coverage(result):
-             scheduler.push(SeedRef(seed_id, "stable_ancestor", score))
-         if has_diff(result):
-             scheduler.push(SeedRef(seed_id, "bug_proximity", 1.0))
-         if promote_mutation:
+         score = task._score
+         decision = task._decision
+         if decision.decision == "promote_mutation":
+             scheduler.push(SeedRef(task.seed_ref.seed_id, decision.queue,
+                                    score, lineage_parent=task.seed_ref.seed_id,
+                                    action=task.seed_ref.action))
              # 变异种子入队（action="mutate", lineage=原种子）
-             # 分配新 seed_id，拷贝 .S 到 seeds/ 目录
-             # 下次 batch dispatch 时 worker 调 worker_mutate() 执行变异
+             # 分配新 seed_id，下次 batch dispatch 时 worker 调 worker_mutate() 执行
              mutated_id = allocate_seed_id()
              scheduler.push(SeedRef(mutated_id, "stable_ancestor",
                                     score, lineage_parent=task.seed_ref.seed_id,
                                     action="mutate"))
-         if archived:
-             pass  # 不入队
+         elif decision.decision == "keep_in_corpus":
+             scheduler.push(SeedRef(task.seed_ref.seed_id, "exploration",
+                                    score, lineage_parent=task.seed_ref.seed_id,
+                                    action=task.seed_ref.action))
+         # archive_only / discard → 不入队
 
      # 5g. 持久化
      corpus.dump_campaign_state()
@@ -196,28 +215,46 @@ Main Process:
      iter += 1
 ```
 
-### 5.4 分数计算
+### 5.4 分数计算与决策
 
-复用 `FeedbackSignalExtractor.extract()`，但传入基于 snapshot 的 coverage_delta 和基于 live corpus 的 rarity（rarity 变化缓慢，batch 间差异可忽略）：
+复用现有 `FeedbackSignalExtractor.extract()` + `FeedbackDecisionPolicy.decide()` 两步，关键差异是 delta 来自 snapshot 而非 live corpus：
 
 ```python
-snapshot_delta = corpus.preview_delta_from_snapshot(snapshot, result.transitions)
+# Step 1: 基于 snapshot 的覆盖 delta（粗粒度 coverage key）
+delta = corpus.preview_delta_from_snapshot(snapshot, result.transitions)
+
+# Step 2: sync 判定
+sync_summary = sync_engine.summary(
+    sync_engine.classify([{"family": f, "cov": ""} for f in result.diff_families])
+)
+
+# Step 3: 信号提取（category_deltas 来自 snapshot, rarity 来自 live corpus）
 signals = signal_extractor.extract(
     status=result.status,
     failure_kind=result.failure_kind,
-    coverage_new_points=snapshot_delta["new_coverage"],
-    coverage_total_points=snapshot_delta["total_coverage"],
-    category_deltas=snapshot_delta.get("by_category", {}),
-    transition_rarities=corpus.get_rarities(),  # live rarities
+    coverage_new_points=delta["new_coverage"],
+    coverage_total_points=delta["total_coverage"],
+    category_deltas=delta["by_category"],
+    transition_rarities=corpus.get_category_rarities(),   # ← 新增：按类别聚合稀有度
     diff_novelty_score=(1.0 if result.diff_families else 0.0),
+    syncable_count=sync_summary["syncable_count"],
 )
 score = signals.exploration_value
+
+# Step 4: 决策
+decision = decision_policy.decide(signals)
+# → promote_mutation (bug_proximity / stable_ancestor)
+# → keep_in_corpus (exploration)
+# → archive_only / discard (不入队)
 ```
+
+`transition_rarities` 参数（之前在所有调用点均为 None）首次被启用：`get_category_rarities()` 按类别聚合 transition 频率，低频类别稀有度更高 → 产生该类覆盖的种子得到更高 `exploration_value`。
 
 ### 5.5 RunCorpus 新增方法
 
 - `snapshot() -> set[str]` — 返回 `_seen_coverage_points.copy()`
-- `preview_delta_from_snapshot(snapshot, transitions) -> dict` — 对比 transitions 与 snapshot 计算 delta（与 `preview_transition_delta_from_transitions` 同理，但不使用 `_seen_transitions`，而是对比 `make_coverage_key()` 产出的粗粒度 key）
+- `preview_delta_from_snapshot(snapshot: set[str], transitions: list[dict]) -> dict` — 用 `make_coverage_key()` 转换 transitions 为粗粒度 key，对比 snapshot（而非 `_seen_transitions`）计算 delta。返回 `{"new_coverage": N, "total_coverage": N, "by_category": {"privilege": {"new": 2, "total": 3}, ...}}`
+- `get_category_rarities() -> dict[str, float]` — 遍历 `_transition_frequency`，按 key 首段（类别名）分组，取每类别 transition 稀有度均值。返回 `{"privilege": 0.72, "float": 0.85, ...}`
 
 ---
 
