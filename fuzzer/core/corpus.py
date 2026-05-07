@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fuzzer.core.fitness import SeedFitness
-from fuzzer.core.status import CaseStatus
-from fuzzer.utils.serde import dump_json
+from core.fitness import SeedFitness
+from core.status import CaseStatus
+from utils.serde import dump_json
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +81,52 @@ class RunCorpus:
             "total_points": total,
             "delta_ratio": ratio,
         }
+
+    def snapshot(self) -> set[str]:
+        """Return a frozen copy of currently-seen coverage points for isolated scoring."""
+        return set(self._seen_coverage_points)
+
+    def preview_delta_from_snapshot(
+        self, snapshot: set[str], transitions: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Compute coverage delta of transitions against a frozen snapshot.
+
+        Uses make_coverage_key() (coarse keys: {category}|{mnemonic}) rather
+        than _serialize_transition (fine keys with register values).
+        """
+        from core.observation import make_coverage_key
+
+        cov_keys: set[str] = set()
+        by_category: dict[str, dict[str, int]] = {}
+        for t in transitions:
+            key = make_coverage_key(t)
+            cov_keys.add(key)
+            cat = t.get("category", "misc")
+            bucket = by_category.setdefault(cat, {"new": 0, "total": 0})
+            bucket["total"] += 1
+            if key not in snapshot:
+                bucket["new"] += 1
+        new_keys = cov_keys - snapshot
+        total = len(cov_keys)
+        new_count = len(new_keys)
+        return {
+            "new_coverage": new_count,
+            "total_coverage": total,
+            "by_category": by_category,
+        }
+
+    def get_category_rarities(self) -> dict[str, float]:
+        """Average transition rarity per CSR category."""
+        import math
+        from collections import defaultdict
+        cat_sums: dict[str, float] = defaultdict(float)
+        cat_counts: dict[str, int] = defaultdict(int)
+        for key, freq in self._transition_frequency.items():
+            cat = key.split("|")[0] if "|" in key else "misc"
+            rarity = 1.0 / (1.0 + math.log2(1.0 + float(freq)))
+            cat_sums[cat] += rarity
+            cat_counts[cat] += 1
+        return {cat: cat_sums[cat] / max(cat_counts[cat], 1) for cat in cat_sums}
 
     def record(self, bundle: Any) -> CorpusEntry:
         status = self._status_of(bundle)
@@ -158,7 +204,7 @@ class RunCorpus:
     def preview_transition_delta_from_transitions(
         self, transitions: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        from fuzzer.core.observation import _serialize_transition
+        from core.observation import _serialize_transition
 
         new_keys: set[str] = set()
         all_keys: set[str] = set()
@@ -189,7 +235,7 @@ class RunCorpus:
         return self.preview_transition_delta_from_transitions(transitions)
 
     def record_transitions(self, transitions: list[dict[str, Any]]) -> dict[str, Any]:
-        from fuzzer.core.observation import _serialize_transition
+        from core.observation import _serialize_transition
 
         new_keys: set[str] = set()
         by_category: dict[str, dict[str, int]] = {}
@@ -302,6 +348,7 @@ class RunCorpus:
             sorted(self._transition_frequency.items(), key=lambda x: -x[1])[:1000]
         )
         payload["transition_frequency_sample"] = freq_sample
+        payload["transition_keys_full"] = sorted(self._seen_transitions)
         payload["diff_family_counts"] = dict(self._diff_family_counts)
         payload["diff_signature_sample"] = {
             fam: sorted(list(sigs))[:200]
@@ -335,7 +382,7 @@ class RunCorpus:
         if isinstance(coverage_points, list):
             self._seen_coverage_points.update(str(item) for item in coverage_points if str(item).strip())
 
-        from fuzzer.core.observation import classify_transition
+        from core.observation import classify_transition
 
         transitions_sample = payload.get("transition_frequency_sample", {})
         if isinstance(transitions_sample, dict):
@@ -347,6 +394,12 @@ class RunCorpus:
                     cat = classify_transition(csr)
                     cat_set = self._seen_transitions_by_category.setdefault(cat, set())
                     cat_set.add(key)
+
+        transition_keys_full = payload.get("transition_keys_full", [])
+        if isinstance(transition_keys_full, list):
+            for key in transition_keys_full:
+                if isinstance(key, str) and key.strip():
+                    self._seen_transitions.add(key.strip())
 
         diff_counts = payload.get("diff_family_counts", {})
         if isinstance(diff_counts, dict):

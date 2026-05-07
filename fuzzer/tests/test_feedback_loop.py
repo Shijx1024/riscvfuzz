@@ -302,6 +302,43 @@ class TestRunCorpus:
         assert delta2["new_points"] == 0
         assert delta2["total_points"] == 2
 
+    def test_snapshot_returns_copy(self):
+        from fuzzer.core.corpus import RunCorpus
+        corpus = RunCorpus()
+        corpus._seen_coverage_points.add("privilege|csrrs")
+        snap = corpus.snapshot()
+        assert "privilege|csrrs" in snap
+        corpus._seen_coverage_points.add("float|fadd.s")
+        assert "float|fadd.s" not in snap  # snapshot is frozen
+
+    def test_preview_delta_from_snapshot(self):
+        from fuzzer.core.corpus import RunCorpus
+        corpus = RunCorpus()
+        corpus._seen_coverage_points.add("privilege|csrrs")
+        snap = corpus.snapshot()
+        transitions = [
+            {"csr": "privilege", "prev_value": "v1", "curr_value": "v2",
+             "instr": "csrrs:0x342", "category": "privilege"},
+            {"csr": "float", "prev_value": "v3", "curr_value": "v4",
+             "instr": "fadd.s:0x53", "category": "float"},
+        ]
+        delta = corpus.preview_delta_from_snapshot(snap, transitions)
+        assert delta["new_coverage"] == 1  # float|fadd.s is new
+        assert delta["total_coverage"] == 2
+
+    def test_get_category_rarities(self):
+        from fuzzer.core.corpus import RunCorpus
+        corpus = RunCorpus()
+        corpus._transition_frequency = {
+            "privilege|v1|v2|csrrs:0x342": 1,
+            "privilege|v3|v4|csrrw:0x123": 8,
+            "float|v5|v6|fadd.s:0x53": 1,
+        }
+        rarities = corpus.get_category_rarities()
+        assert "privilege" in rarities
+        assert "float" in rarities
+        assert 0.3 < rarities["privilege"] < 0.6
+
 
 class TestSyncDecisionEngine:
     def test_csr_write_syncable(self):
