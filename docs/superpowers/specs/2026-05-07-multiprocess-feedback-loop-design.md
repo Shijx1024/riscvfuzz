@@ -74,19 +74,23 @@ class WorkerTask:
 
 ### 2.3 WorkerResult — worker 返回的观测数据
 
+精简设计，仅包含主进程评估需要的字段（`ExecuteResult` 现有 19 个字段中仅 6 个被活跃使用，其余 13 个为死字段）：
+
 ```python
 @dataclass
 class WorkerResult:
     seed_id: str
     img_path: str
-    status: str               # "executed" | "diff_failed" | "timeout" | "infra_error"
-    failure_kind: str | None
-    message: str
+    status: str               # CaseStatus 枚举值
     exit_code: int
     duration_s: float
-    transitions: list[dict]   # CSR 转移列表
+    failure_kind: str | None  # FailureKind 枚举值
+    message: str
+    transitions: list[dict]   # CSR 转移列表 (observation.py 解析)
     diff_families: list[str]  # diff 族标签
 ```
+
+sync 判定（`syncable_count` / `potential_bug_count`）不在 worker 内计算，保留给主进程的 `SyncDecisionEngine`。
 
 ---
 
@@ -291,7 +295,28 @@ if delta.get("total", 0) > 0:
 - `preview_delta_from_snapshot(snapshot: set[str], transitions: list[dict]) -> dict` — 用 `make_coverage_key()` 转换 transitions 为粗粒度 key，对比 snapshot（而非 `_seen_transitions`）计算 delta。返回 `{"new_coverage": N, "total_coverage": N, "by_category": {"privilege": {"new": 2, "total": 3}, ...}}`
 - `get_category_rarities() -> dict[str, float]` — 遍历 `_transition_frequency`，按 key 首段（类别名）分组，取每类别 transition 稀有度均值。返回 `{"privilege": 0.72, "float": 0.85, ...}`
 
-### 5.7 Transition 全量持久化
+### 5.7 build_bundle() 规范：显式使用 CaseStatus 枚举
+
+当前 `dut_executor.py:372-377` 用裸字符串映射 status（`"executed"`, `"diff_failed"` 等），绕过了 `CaseStatus` 枚举。本次改造中 `build_bundle()` 显式使用枚举：
+
+```python
+def build_bundle(seed_ref: SeedRef, result: WorkerResult,
+                 execute_result: ExecuteResult) -> dict:
+    status_str = result.status  # 已是 CaseStatus 枚举值
+    return {
+        "case_id": result.seed_id,  # seed_id 即 case_id
+        "seed": seed_ref.seed_id,
+        "lineage_parent": seed_ref.lineage_parent,
+        "status": status_str,
+        "coverage_result": {"points": {...}, "status": "collected"},
+        "execute_result": execute_result,
+        "feedback_decision": None,  # 由 5d 决策后填充
+    }
+```
+
+`WorkerResult.status` / `WorkerResult.failure_kind` 在 worker 内也使用枚举值，避免字符串拼写错误。
+
+### 5.8 Transition 全量持久化
 
 `dump_campaign_state()` 当前只保存频率 top 1000 的 transition key（`transition_frequency_sample`），低频 transition 在恢复时丢失。本次修改追加 `"transition_keys_full"` 字段，保存完整 `_seen_transitions` 集合，消除有损恢复。
 
@@ -374,6 +399,10 @@ def _setup_worker_singletons(allowed_ext_name: str, architecture: str):
 
 worker 解析 observation 后立即删除 observe 文件（数据已提取到 WorkerResult），避免磁盘膨胀。
 
+### 6.4 worker_generate 优化：绕开嵌套线程池
+
+`process_assembly_files()`（`elf_to_img.py:80`）内部用 `ThreadPoolExecutor` 并行编译所有 `.S` 文件。当 `seed_times=1`（每 worker 只生成 1 个种子）时，嵌套线程池是浪费。`worker_generate()` 直接调用底层的 `process_file(seed_file, output_dir, img_dir, elf_dir)` 替代，消除不必要的线程创建。
+
 ---
 
 ## 7. 持久化与容错
@@ -408,6 +437,10 @@ worker 解析 observation 后立即删除 observe 文件（数据已提取到 Wo
   "exploration": [{"seed_id": "000020", "score": 0.45, "lineage": "000018"}]
 }
 ```
+
+### 7.1.1 serde.py 补齐 load_json
+
+当前 `serde.py` 只有 `dump_json()`（只写不读）。新增 `load_json(path: Path) -> Any` 统一 JSON 反序列化入口。`campaign_state.json` 和 `queue_state.json` 的加载均通过此函数。
 
 ### 7.2 保存时机
 
@@ -445,8 +478,9 @@ worker 解析 observation 后立即删除 observe 文件（数据已提取到 Wo
 | `fuzzer/core/corpus.py` | **修改** | 新增 snapshot(), preview_delta_from_snapshot(), get_category_rarities(); dump_campaign_state 追加 transition_keys_full |
 | `fuzzer/core/fitness.py` | **修改** | 激活 FitnessCalculator（5d 打分时调用 evaluate + update_lineage） |
 | `fuzzer/core/feedback_loop.py` | **修改** | extract() 加固 .get() 防御 KeyError |
+| `fuzzer/utils/serde.py` | **修改** | 新增 load_json() |
 | `fuzzer/executor/worker.py` | **新建** | worker_entry(), _setup_worker_singletons(), worker_generate(), worker_mutate(), worker_execute() |
-| `fuzzer/executor/dut_executor.py` | **修改** | _run_dut_tests_with_feedback() → Manager-Worker 调度循环 |
+| `fuzzer/executor/dut_executor.py` | **修改** | _run_dut_tests_with_feedback() → Manager-Worker 调度循环; build_bundle() 用 CaseStatus 枚举 |
 | `fuzzer/run_dut.py` | **修改** | 加载 queue_state.json; 保存 scheduler dump; 传递完整参数给 WorkerTask |
 | `fuzzer/tests/test_feedback_loop.py` | **更新** | ScheduledSeed → SeedRef 适配; 新增 pop_best、snapshot delta、FitnessCalculator 测试 |
 
@@ -465,8 +499,9 @@ worker 解析 observation 后立即删除 observe 文件（数据已提取到 Wo
 2. `scheduler.py` — ScheduledSeed → SeedRef, heapq, pop_best, dump/restore
 3. `corpus.py` — 新增 snapshot(), preview_delta_from_snapshot(), get_category_rarities(); dump_campaign_state 追加 transition_keys_full
 4. `feedback_loop.py` — extract() 加固 .get()
-5. `fitness.py` — 确保 FitnessCalculator.evaluate() 对接新数据流（调整参数签名如需）
-6. `worker.py` — 从 divefuzz_adapter.py 抽取无状态 worker 函数 + 单例初始化
-7. `dut_executor.py` — 新调度循环替换 _run_dut_tests_with_feedback
-8. `run_dut.py` — 加载/保存 queue_state，传参适配
-9. 测试更新 — 适配新类型，新增 pop_best、snapshot delta、FitnessCalculator 测试
+5. `fitness.py` — 确保 FitnessCalculator.evaluate() 对接新数据流
+6. `serde.py` — 新增 load_json()
+7. `worker.py` — 从 divefuzz_adapter.py 抽取无状态 worker 函数 + 单例初始化 + process_file 直调
+8. `dut_executor.py` — 新调度循环 + build_bundle() CaseStatus 枚举化
+9. `run_dut.py` — 加载/保存 queue_state，传参适配
+10. 测试更新 — 适配新类型，新增 pop_best、snapshot delta、FitnessCalculator 测试
