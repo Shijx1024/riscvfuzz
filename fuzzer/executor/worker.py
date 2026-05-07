@@ -11,8 +11,8 @@ from fuzzer.core.status import CaseStatus, FailureKind
 
 
 def seed_path(output_dir: Path, seed_id: str) -> Path:
-    """Convention: {output_dir}/{seed_id}/seed_0.img"""
-    return output_dir / seed_id / "seed_0.img"
+    """Convention: {output_dir}/{seed_id}/img_file/seed_0.img"""
+    return output_dir / seed_id / "img_file" / "seed_0.img"
 
 
 def _setup_worker_singletons(allowed_ext_name: str, architecture: str) -> None:
@@ -80,8 +80,10 @@ def worker_mutate(
     from fuzzer.generator.core.mutator import mutate_instructions_parallel
     from fuzzer.utils.elf_to_img import process_file
 
-    # Locate parent .S file (parent_dir is {output_dir}/{parent_id}/)
-    parent_dir = parent_img.parent
+    # Locate parent .S file.
+    # parent_img = {output_dir}/{parent_id}/img_file/seed_0.img
+    # parent_dir = {output_dir}/{parent_id}  (two levels up from img_file)
+    parent_dir = parent_img.parent.parent
     asm_files = list(parent_dir.glob("*.S"))
     if not asm_files:
         raise RuntimeError(f"No .S file for parent seed {parent_img}")
