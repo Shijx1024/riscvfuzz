@@ -404,8 +404,13 @@ def _run_dut_tests_with_feedback(config: Config, config_filename: str,
                     task = futures[fut]
                     logger.error("[RVFUZZ] Worker failed for seed %s: %s",
                                  task.seed_ref.seed_id, exc)
-                    scheduler.push(SeedRef(task.seed_ref.seed_id, "exploration",
-                                           0.1, action=task.seed_ref.action))
+                    # If mutation keeps failing, fall back to generate
+                    fallback_action = task.seed_ref.action
+                    if fallback_action == "mutate":
+                        fallback_action = "generate"
+                    scheduler.push(SeedRef(task.seed_ref.seed_id, "exploration", 0.1,
+                                           lineage_parent=task.seed_ref.lineage_parent,
+                                           action=fallback_action))
 
         result_map = {r.seed_id: r for r in results}
 
