@@ -1,5 +1,6 @@
 """Integration tests for RVFUZZ feedback loop implanted in DiveFuzz."""
 
+import heapq
 import json
 import tempfile
 from pathlib import Path
@@ -10,56 +11,59 @@ import pytest
 
 class TestScheduler:
     def test_push_and_pop_priority_order(self):
-        from fuzzer.core.scheduler import GoalDirectedScheduler, ScheduledSeed
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        from fuzzer.core.seed_ref import SeedRef
 
         scheduler = GoalDirectedScheduler()
-        scheduler.push(ScheduledSeed(seed="s1", queue="exploration"))
-        scheduler.push(ScheduledSeed(seed="s2", queue="bug_proximity"))
-        scheduler.push(ScheduledSeed(seed="s3", queue="stable_ancestor"))
+        scheduler.push(SeedRef(seed_id="s1", queue="exploration"))
+        scheduler.push(SeedRef(seed_id="s2", queue="bug_proximity"))
+        scheduler.push(SeedRef(seed_id="s3", queue="stable_ancestor"))
 
         # bug_proximity has highest priority
         first = scheduler.pop_next()
-        assert first.seed == "s2"
+        assert first.seed_id == "s2"
         assert first.queue == "bug_proximity"
 
         # exploration next
         second = scheduler.pop_next()
-        assert second.seed == "s1"
+        assert second.seed_id == "s1"
 
         # stable_ancestor last
         third = scheduler.pop_next()
-        assert third.seed == "s3"
+        assert third.seed_id == "s3"
 
         assert scheduler.pop_next() is None
 
     def test_duplicate_seeds_rejected(self):
-        from fuzzer.core.scheduler import GoalDirectedScheduler, ScheduledSeed
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        from fuzzer.core.seed_ref import SeedRef
 
         scheduler = GoalDirectedScheduler()
-        assert scheduler.push(ScheduledSeed(seed="dup", queue="exploration")) is True
-        assert scheduler.push(ScheduledSeed(seed="dup", queue="bug_proximity")) is False
+        assert scheduler.push(SeedRef(seed_id="dup", queue="exploration")) is True
+        assert scheduler.push(SeedRef(seed_id="dup", queue="bug_proximity")) is False
         assert len(scheduler) == 1
 
     def test_saturation_boost_reorders_queue(self):
-        from fuzzer.core.scheduler import GoalDirectedScheduler, ScheduledSeed
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        from fuzzer.core.seed_ref import SeedRef
 
         scheduler = GoalDirectedScheduler()
         # Tag a seed with "memory" category
         scheduler.tag_seed("s1", "memory")
-        scheduler.push(ScheduledSeed(seed="s1", queue="exploration"))
-        scheduler.push(ScheduledSeed(seed="s2", queue="exploration"))
+        scheduler.push(SeedRef(seed_id="s1", queue="exploration"))
+        scheduler.push(SeedRef(seed_id="s2", queue="exploration"))
 
-        # Without saturation boost, s1 comes first (FIFO)
+        # Without saturation boost, s1 comes first (heapq by score, tie=0.0)
         first = scheduler.pop_next()
-        assert first.seed == "s1"
+        assert first.seed_id == "s1"
 
         # Now push more seeds and update saturations so that "memory" is the
         # lowest-saturation category.  All categories default to 0.0, so we
         # must update every category — any category left at 0.0 will be chosen
         # as the target instead of "memory".
         scheduler.tag_seed("s3", "memory")
-        scheduler.push(ScheduledSeed(seed="s3", queue="exploration"))
-        scheduler.push(ScheduledSeed(seed="s4", queue="exploration"))
+        scheduler.push(SeedRef(seed_id="s3", queue="exploration"))
+        scheduler.push(SeedRef(seed_id="s4", queue="exploration"))
 
         # Give every category total > 0 so saturation is computed for all.
         # memory: new=5,total=10  → novelty_rate=0.5 → saturation=0.25 (<0.3)
@@ -75,12 +79,50 @@ class TestScheduler:
 
         # s3 should be boosted ahead of s4 due to low memory saturation
         boosted = scheduler.pop_next()
-        assert boosted.seed == "s3"
+        assert boosted.seed_id == "s3"
 
     def test_pop_next_exhausted_returns_none(self):
         from fuzzer.core.scheduler import GoalDirectedScheduler
         scheduler = GoalDirectedScheduler()
         assert scheduler.pop_next() is None
+
+    def test_pop_best_weighted_distribution(self):
+        from fuzzer.core.seed_ref import SeedRef
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        s = GoalDirectedScheduler()
+        for i in range(10):
+            s.push(SeedRef(f"e{i:02d}", "exploration", score=float(i) / 10.0))
+        for i in range(5):
+            s.push(SeedRef(f"s{i:02d}", "stable_ancestor", score=float(i) / 5.0))
+        for i in range(3):
+            s.push(SeedRef(f"b{i:02d}", "bug_proximity", score=1.0))
+        batch = s.pop_best(6)
+        assert len(batch) <= 6
+        queues = [r.queue for r in batch]
+        assert "bug_proximity" in queues
+
+    def test_pop_best_exhausted_returns_partial(self):
+        from fuzzer.core.seed_ref import SeedRef
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        s = GoalDirectedScheduler()
+        s.push(SeedRef("s1", "exploration", score=0.5))
+        batch = s.pop_best(10)
+        assert len(batch) == 1
+
+    def test_dump_and_restore_queue(self, tmp_path):
+        from fuzzer.core.seed_ref import SeedRef
+        from fuzzer.core.scheduler import GoalDirectedScheduler
+        s = GoalDirectedScheduler()
+        s.push(SeedRef("s1", "exploration", score=0.8, lineage_parent="p1", action="generate"))
+        s.push(SeedRef("s2", "bug_proximity", score=1.0, action="mutate"))
+        path = tmp_path / "queue_state.json"
+        s.dump_queue(path)
+        assert path.exists()
+        s2 = GoalDirectedScheduler()
+        s2.restore(path)
+        popped = s2.pop_next()
+        assert popped is not None
+        assert popped.seed_id in {"s1", "s2"}
 
 
 class TestFeedbackSignals:
@@ -93,7 +135,6 @@ class TestFeedbackSignals:
             failure_kind=None,
             coverage_new_points=5,
             coverage_total_points=10,
-            duration_s=3.0,
         )
         assert signals.status == "executed"
         assert signals.coverage_new_points == 5
@@ -109,7 +150,6 @@ class TestFeedbackSignals:
             failure_kind="diff_mismatch",
             coverage_new_points=0,
             coverage_total_points=5,
-            duration_s=10.0,
             diff_novelty_score=1.0,
             syncable_count=2,
         )
@@ -126,7 +166,6 @@ class TestFeedbackSignals:
             failure_kind=None,
             coverage_new_points=0,
             coverage_total_points=0,
-            duration_s=1.0,
         )
         assert signals.coverage_new_points == 0
         assert signals.exploration_value == 0.0
@@ -140,7 +179,7 @@ class TestDecisionPolicy:
         signals = FeedbackSignals(
             status="diff_failed", failure_kind="diff_mismatch",
             coverage_new_points=0, coverage_total_points=0,
-            duration_s=1.0, exploration_value=0.8,
+            exploration_value=0.8,
             diff_novelty_score=1.0,
         )
         decision = policy.decide(signals)
@@ -154,7 +193,7 @@ class TestDecisionPolicy:
         signals = FeedbackSignals(
             status="executed", failure_kind=None,
             coverage_new_points=3, coverage_total_points=10,
-            duration_s=2.0, exploration_value=0.5,
+            exploration_value=0.5,
         )
         decision = policy.decide(signals)
         assert decision.decision == "promote_mutation"
@@ -167,7 +206,7 @@ class TestDecisionPolicy:
         signals = FeedbackSignals(
             status="executed", failure_kind=None,
             coverage_new_points=0, coverage_total_points=10,
-            duration_s=1.0, exploration_value=0.0,
+            exploration_value=0.0,
         )
         decision = policy.decide(signals)
         assert decision.decision == "keep_in_corpus"
