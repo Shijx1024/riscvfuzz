@@ -2,7 +2,7 @@
 
 > 2026-05-06 — 为 RVFUZZ 反馈回路植入进行的全面架构分析
 >
-> **更新 2026-05-06** — 补充 RVFUZZ 反馈回路植入后的架构变更、fuzzer/core/ 模块详解、双路径控制流
+> **更新 2026-05-07** — 多进程 Manager-Worker 批量反馈回路, SeedRef/WorkerTask/WorkerResult 数据模型, heapq 调度器, snapshot 隔离打分, FitnessCalculator 激活
 
 ## 项目概览
 
@@ -15,9 +15,12 @@ learn/DiveFuzz/
   fuzzer/                  # 核心 fuzzer 代码
     run_dut.py             # 主入口 (YAML 驱动)
     config/                # 配置解析 (dut_config, divefuzz_config, logger_config)
-    executor/              # DUT 测试执行 (dut_executor, divefuzz_adapter)
+    executor/              # DUT 测试执行
+      dut_executor.py      # 调度循环 (Manager-Worker) + 原始批处理
+      worker.py            # [RVFUZZ 新增] 无状态 worker 入口 (gen→exec→observe)
+      divefuzz_adapter.py  # setup_divefuzz, run_divefuzz_single, run_divefuzz_mutate
     utils/                 # elf_to_img, results_reporter, serde
-    generator/             # 指令生成与变异引擎 (核心, 原装未修改)
+    generator/             # 指令生成与变异引擎 (原装未修改)
       main.py              # 独立生成器入口
       config/              # CLI 解析器, config_manager
       core/
@@ -27,32 +30,30 @@ learn/DiveFuzz/
       reg_analyzer/        # SpikeSession, InstructionValidator, XORCache, HybridEncoder
       asm_template_manager/ # 汇编模板 (header/footer per CPU)
       bug_filter/          # 精度过滤器框架 (pre-execute + post-execute, 按架构注册)
-      utils/
     core/                  # [RVFUZZ 新增] 反馈回路组件
+      seed_ref.py          # SeedRef, WorkerTask, WorkerResult dataclass
       status.py            # CaseStatus, FailureKind, ArtifactKind, RunStatus 枚举
-      observation.py       # CSR 转移提取 + Diff 族分类
+      observation.py       # CSR 转移提取 + make_coverage_key + trivial CSR write 过滤
       sync.py              # SyncDecisionEngine (13 条同步/漏洞判定规则)
-      scheduler.py         # MultiQueueScheduler + GoalDirectedScheduler
+      scheduler.py         # MultiQueueScheduler + GoalDirectedScheduler (heapq + pop_best)
       feedback_loop.py     # FeedbackSignalExtractor + FeedbackDecisionPolicy
-      corpus.py            # RunCorpus (去重, 稀有度, 持久化)
-      fitness.py           # SeedFitness, FitnessCalculator, MUTATION_STRATEGIES
+      corpus.py            # RunCorpus (snapshot, preview_delta_from_snapshot, get_category_rarities)
+      fitness.py           # SeedFitness, FitnessCalculator (已激活, dominant_category)
     model/                 # [RVFUZZ 新增] 数据模型
-      request.py           # MutationRequest dataclass
-      result.py            # ExecuteResult, MutationResult dataclasses
+      request.py           # MutationRequest (未使用, 死代码)
+      result.py            # ExecuteResult dataclass
     tests/                 # [RVFUZZ 新增] 测试
-      test_feedback_loop.py # 22 个集成测试
+      test_feedback_loop.py # 34 个集成测试 (10 个测试类)
   dut/                     # RTL 仿真器 (子模块)
     rocket-chip/           # Rocket Chip (Chisel RISC-V SoC)
-    NutShell/              # NutShell CPU
-    XiangShan/             # 香山 CPU (子模块, 未本地克隆)
   ref/                     # 参考模拟器 (子模块)
     riscv-isa-sim-adapter/ # 修改的 Spike + pybind11 checkpoint engine
-    riscv-isa-sim/         # 原版 Spike (非直接使用)
   configs/                 # [RVFUZZ 新增] 反馈回路配置
     rocket_feedback.yaml   # Rocket + 反馈回路集成测试配置
   docs/
-    divefuzz-architecture-exploration.md  # 本报告 (架构探索)
-    rvfuzz-feedback-implantation.md       # RVFUZZ 植入报告 (文件变更、植入点映射)
+    divefuzz-architecture-exploration.md  # 本报告
+    superpowers/specs/2026-05-07-multiprocess-feedback-loop-design.md
+    superpowers/plans/2026-05-07-multiprocess-feedback-loop-plan.md
 ```
 
 ## 控制流
@@ -69,45 +70,62 @@ main()
   │    scheduler = GoalDirectedScheduler()
   │    signal_extractor = FeedbackSignalExtractor()
   │    decision_policy = FeedbackDecisionPolicy()
+  ├─ [P0.1] 加载 campaign_state.json + queue_state.json (跨运行恢复)
   └─ run_dut_tests(config, config_filename, feedback={...})
        ├─ if feedback is not None:
-       │    _run_dut_tests_with_feedback()  ← 默认路径 (RVFUZZ 回路)
+       │    _run_dut_tests_with_feedback()  ← 默认路径 (Manager-Worker 批量回路)
        └─ else:
             _run_dut_tests_original()       ← 向后兼容 (原始批处理)
 ```
 
-### 路径 A：RVFUZZ 反馈回路 (默认, `_run_dut_tests_with_feedback`)
+### 路径 A：Manager-Worker 批量反馈回路 (默认, `_run_dut_tests_with_feedback`)
 
 ```
 run_dut.py
-  └─ while index < batch_size:
-       ├─ [P1] scheduler.pop_next()
-       │        └─ 三队列优先级: bug_proximity > exploration > stable_ancestor
-       │        └─ GoalDirectedScheduler: 低饱和度类别 boost (< 0.3)
-       ├─ [P2] run_divefuzz_single()
-       │        └─ generate_instructions_parallel(seed_times=1, max_workers=1)
-       │             └─ 生成 1 个种子 (DiveFuzz 原装生成器)
-       ├─ [P3] run_single_seed_with_observation()
-       │        ├─ subprocess.run(emu_cmd)
-       │        ├─ extract_csr_transitions(observe_path)
-       │        │    └─ 解析 JSONL coverage 事件 → (csr, prev, curr, instr, category)
-       │        ├─ classify_diff_family(observe_path)
-       │        │    └─ 解析 JSONL error/mismatch 事件 → 7 族标签
-       │        └─ SyncDecisionEngine.classify(diff_events)
-       │             └─ syncable / potential_bug 判定
-       ├─ [P4] FeedbackSignalExtractor.extract()
-       │        └─ 计算 exploration_value (加权稀有度 × 新颖性)
-       ├─ [P5] FeedbackDecisionPolicy.decide()
-       │        ├─ DIFF/REF/BADTRAP/TIMEOUT/COVERAGE_FAILED → promote_mutation (bug_proximity)
-       │        ├─ EXECUTED + 新覆盖                          → promote_mutation (stable_ancestor)
-       │        ├─ EXECUTED + 无新覆盖                        → keep_in_corpus (exploration)
-       │        └─ GENERATED                                  → archive_only
-       ├─ [P6] promote_mutation 时:
-       │        scheduler.push(mut-{seed}, queue=decision.queue)
-       ├─ [P7] scheduler.push(gen-{next_index}, queue=exploration)
-       │        scheduler.update_saturation(category_deltas, rarities)
-       └─ [P8] corpus.dump_state() — 循环结束后持久化
+  ├─ setup_divefuzz() → 产出 ArchConfig
+  ├─ warmup: if scheduler empty → 生成 M 个初始种子 → worker 执行 → 打分入队
+  │
+  └─ while iter < batch_size and scheduler not empty:
+       ├─ snapshot = corpus.snapshot()           # 冻结当前覆盖点
+       ├─ scheduler.pop_best(M)                  # 三队列加权出队 (50/30/20)
+       │    └─ exploration/stable_ancestor: heapq 按 score; bug_proximity: FIFO
+       ├─ pool.map(worker_entry, tasks)          # ProcessPoolExecutor 并行
+       │    └─ worker_entry(task: WorkerTask) → WorkerResult
+       │         ├─ action="generate" → worker_generate() → generate_instructions_parallel
+       │         │    └─ process_file() 直调 (避免嵌套 ThreadPoolExecutor)
+       │         ├─ action="mutate"    → worker_mutate()    → mutate_instructions_parallel
+       │         ├─ worker_execute()   → subprocess.run(emu_cmd)
+       │         │    └─ observe: difftest.observe.{seed_id}.jsonl (per-worker 隔离)
+       │         └─ parse_observation() → 解析后删除 observe 文件
+       │
+       ├─ 第一遍 (snapshot 隔离打分):
+       │    for each result:
+       │      delta = corpus.preview_delta_from_snapshot(snapshot, transitions)
+       │      signals = signal_extractor.extract(...)    # category_deltas + rarities
+       │      fitness = fitness_calc.evaluate(...)       # 激活 FitnessCalculator
+       │      decision = decision_policy.decide(signals)
+       │
+       ├─ 第二遍 (更新全局 corpus):
+       │    for each result:
+       │      corpus.record_transitions() + corpus.record_diff_families()
+       │      scheduler.update_saturation() + scheduler.tag_seed()
+       │      corpus.record(bundle)
+       │
+       ├─ 第三遍 (按决策入队):
+       │    for each result:
+       │      promote_mutation → push 原种子 + push 变异种子 (action="mutate")
+       │      keep_in_corpus  → push 原种子 (exploration)
+       │      archive_only    → 不入队
+       │
+       └─ persist: corpus.dump_campaign_state() + scheduler.dump_queue_state()
 ```
+
+**关键设计决策**:
+- corpus/scheduler/decision 只在主进程 — 无锁、无竞争
+- snapshot 隔离打分 — batch 内所有种子基于同一基线
+- M = `dut_config.threads` — 复用 DiveFuzz 已有配置
+- 变异异步入队 — 不阻塞当前 batch dispatch
+- observe 文件 per-seed 隔离, 解析后自动删除
 
 ### 路径 B：原始批处理 (向后兼容, `_run_dut_tests_original`)
 
@@ -135,8 +153,6 @@ main()
               └─ subprocess.run(emu_cmd, cwd=emu_path, timeout=300)
                    └─ TestResult(SUCCESS/FAILURE/TIMEOUT/ERROR)
 ```
-
-**关键特征:** 原始 DiveFuzz 没有传统的生成→执行→反馈循环。它是一次性的两阶段管道：生成 N 个种子 → 批量执行 → 报告结果。RVFUZZ 植入后，默认路径变为逐种子迭代的闭环 fuzzing。
 
 ---
 
@@ -184,6 +200,8 @@ while instr_count < target:
 6. Spike 验证每条变异指令
 ```
 
+**已知限制**: 指令分布均匀时 (所有指令频率相同), Z-score = 0, 全部进 increase_queue, 修改逻辑产生空序列导致变异失败。需要足够复杂程序才能成功变异。
+
 ### 4. Bug Filter (`bug_filter/`)
 
 ```python
@@ -194,8 +212,6 @@ FilterRegistry:
   - 按架构注册: xs (XiangShan), nts (NutShell), boom (BOOM), cva6 (CVA6), rkt (Rocket)
   - FilterContext 懒加载: XPR, FPR, CSR, PC, privilege, virtualization, reservation, trap, vector
 ```
-
-以 XiangShan 为例，包含类别: V-5 (vstart_nonzero), C-1 (cycle_counter_read), W-15 (frm_reserved), M-1 (misaligned_access), P-1 (wfi_timeout), T-1 (trap_tval), W-2 (tvec_base_alignment), W-3 (mstatus_fs_vs_warl), C-4 (minstret_trap_boundary) 等。
 
 ### 5. Spike Integration (`riscv-isa-sim-adapter/`)
 
@@ -213,7 +229,17 @@ spike_engine (C++ pybind11):
 
 ### 6. fuzzer/core/ 模块详解
 
-#### 6.1 status.py — 状态枚举
+#### 6.1 seed_ref.py — 数据模型
+
+```python
+SeedRef     # 队列元素 (seed_id, queue, score, lineage_parent, action)
+WorkerTask  # dispatch 给 worker 的完整上下文 (含 arch, emu_cmd, 生成参数)
+WorkerResult # worker 返回的观测数据 (status, transitions, diff_families)
+```
+
+`SeedRef` 替换了旧的 `ScheduledSeed`。`__lt__` 反转 heapq (min-heap → max-heap by score)。
+
+#### 6.2 status.py — 状态枚举
 
 ```python
 CaseStatus:  GENERATED | GENERATION_FAILED | INVALID_PROGRAM | EXECUTED |
@@ -222,14 +248,9 @@ CaseStatus:  GENERATED | GENERATION_FAILED | INVALID_PROGRAM | EXECUTED |
 
 FailureKind: GENERATION_ERROR | INVALID_PROGRAM | BAD_TRAP | INFRA_ERROR |
              REFERENCE_ERROR | DIFF_MISMATCH | TIMEOUT | COVERAGE_COLLECTION_FAILED
-
-ArtifactKind: ASM | BIN | IMG | ELF_ALIAS | RAW_ELF | DUMP | SYMBOL |
-              CMD_HISTORY | COVERAGE_RAW
-
-RunStatus:    RUNNING | COMPLETED | ABORTED
 ```
 
-#### 6.2 observation.py — CSR 转移 + Diff 族
+#### 6.3 observation.py — CSR 转移 + Diff 族
 
 **CSR 类别 (5+1):**
 
@@ -242,10 +263,13 @@ RunStatus:    RUNNING | COMPLETED | ABORTED
 | counter | cycle, instret, mcycle, minstret, mcounteren, scounteren, mhpmevent3-31 | 0.5 |
 | misc | (所有未在以上 5 类中的 CSR) | 0.3 |
 
-`extract_csr_transitions(observation_path)` 从 DiffTest JSONL 解析 coverage 事件：
-- 格式: `csr:{name}:{prev}->{curr}:{instr}`
-- 过滤: 去除 trivial CSR-write（仅目标 CSR 变化且指令为 csrw/csrwi/csrs/csrc）
-- 返回每条的 `{csr, prev_value, curr_value, instr, category}`
+**两层覆盖粒度**:
+- **粗粒度 (覆盖点)**: `make_coverage_key()` → `"{category}|{mnemonic}"` — 用于 corpus 去重和 scheduler 打分
+- **细粒度 (转移)**: `_serialize_transition()` → `"{csr}|{prev}|{curr}|{instr}"` — 用于稀有度追踪
+
+**过滤**:
+- `_parse_cov_field()`: 过滤 prev==curr (无变化) 和空值
+- `_is_trivial_csr_write()`: 过滤 CSR 显式写指令 (csrrw/csrrs/csrrc 等) 对 privilege/float 类别的修改
 
 **Diff 族 (7):**
 
@@ -259,53 +283,36 @@ RunStatus:    RUNNING | COMPLETED | ABORTED
 | memory_ordering | lr/sc/amo/fence 排序或预留不匹配 | 指令为原子/内存序 |
 | unknown | 以上均不匹配 | 默认 |
 
-`classify_diff_family(observation_path)` 仅处理 severity=error/fatal 或 event=mismatch 的事件。
+#### 6.4 sync.py — 同步判定引擎
 
-#### 6.3 sync.py — 同步判定引擎
+无状态 `SyncDecisionEngine`，`classify()` + `summary()`。13 条 syncable/potential_bug 规则。主进程多次调用安全。
 
-`SyncDecisionEngine` 对 diff 事件分类为 `syncable` 或 `potential_bug`：
+#### 6.5 scheduler.py — 目标导向调度器
 
-**Syncable (可同步，非 Bug):**
-- `csr_write` on mstatus/sstatus → "FS field implementation difference"
-- `csr_write` on fflags/fcsr → "FP CSR implementation difference"
-- `csr_write` on frm → "Rounding mode implementation difference"
-- `fp_rounding` → "FP rounding +/-1ulp"
-- `fp_nan` → "Both sides NaN"
-- `trap_difference` with same mcause → "Same exception type, timing difference"
+**MultiQueueScheduler** — 三队列 + 批量概率出队:
 
-**Potential Bug (潜在漏洞):**
-- `csr_write` on sepc/mepc → "LSB may be non-zero"
-- `csr_write` on mhartid → "should be read-only zero"
-- `csr_write` on other CSR → "CSR write mismatch"
-- `trap_difference` with different mcause → "Different exception types"
-- 其余所有族 → "Unclassified mismatch"
-
-#### 6.4 scheduler.py — 目标导向调度器
-
-**MultiQueueScheduler** — 三队列优先级:
 ```
-bug_proximity (最高)  → 接近 Bug 的种子 (DIFF/REF/BADTRAP/TIMEOUT)
-exploration           → 探索性种子 (默认)
-stable_ancestor       → 产生新覆盖的已执行种子
+pop_best(M):
+  bug_proximity:     50% (FIFO — bug 候选同等重要)
+  stable_ancestor:   30% (heapq 按 score 降序)
+  exploration:       20% (heapq 按 score 降序)
 ```
 
-去重: `_seen_seeds` 集合防止重复入队。
+- `push(SeedRef)`: 去重 `_seen_seeds`; heapq 队列用 `heappush`
+- `pop_best(M)`: 加权批量出队, 队列不足时返回部分结果
+- `dump_queue(path)` / `restore(path)`: JSON 持久化, 跨运行恢复
 
-**GoalDirectedScheduler** — 基于类别饱和度的优先级 Boost:
-- 每类别计算饱和度: `saturation = 1.0 - rarity × (0.5 + 0.5 × novelty_rate)`
-- 当某类别 saturation < 0.3 时，扫描所有队列寻找标记为该类别的种子并优先弹出
-- `tag_seed(seed, category)` 标记种子最常触发的 CSR 类别
-- `update_saturation(category_deltas, transition_rarities)` 更新饱和度
+**GoalDirectedScheduler** — 保留饱和度 boost:
+- 低饱和度类别 (< 0.3) 的种子在扫描时优先弹出
+- `tag_seed(seed_id, category)` 记录种子主导类别
+- `update_saturation(category_deltas)` 更新饱和度
 
-**ScheduledSeed**: `{seed, queue, lineage_parent}`
-
-#### 6.5 feedback_loop.py — 信号提取 + 决策
+#### 6.6 feedback_loop.py — 信号提取 + 决策
 
 **FeedbackSignalExtractor**:
 - 按类别加权计算 `exploration_value = Σ(weight × rarity × new/total) / Σ(weight)`
-- 有 diff 时 `exploration_value = max(exploration_value, 0.5 + 0.5 × diff_novelty_score)`
-- 无类别增量时用简单覆盖率比例
-- 输出 `FeedbackSignals{status, coverage_new_points, coverage_total_points, duration_s, exploration_value, diff_novelty_score, syncable_count}`
+- `transition_rarities` 参数已激活 (来自 `corpus.get_category_rarities()`)
+- `extract()` 加固: `.get("total", 0)` / `.get("new", 0)` 防御 KeyError
 
 **FeedbackDecisionPolicy**:
 ```
@@ -318,190 +325,145 @@ EXECUTED + coverage_new_points > 0
 EXECUTED + 无新覆盖
   → keep_in_corpus (exploration, score=0.2)
 
-GENERATED
-  → archive_only (exploration, score=0.1)
-
-其他
-  → discard (exploration, score=0.0)
+其他 → discard (exploration, score=0.0)
 ```
 
-#### 6.6 corpus.py — 运行语料库
+#### 6.7 corpus.py — 运行语料库
 
 `RunCorpus` 管理模糊测试运行中的种子多样性、去重和持久化：
 
-- **去重**: `_seen_signatures` (SHA1 签名), `_seen_coverage_points`, `_seen_transitions`
-- **记住**: `_retained_seed_order` (FIFO, max_retained=1024)
-- **稀有度**: `_transition_frequency` → `get_transition_rarity(key) = 1/(1+log2(1+freq))`
-- **持久化**: `dump_state()` (精简), `dump_campaign_state()` (全面，含 seed fitness)
-- **恢复**: `bootstrap_from_campaign_state()` 从上次运行恢复状态
-- **兼容性**: `_get()`/`_set()` helper 可同时处理对象属性和 dict (跨 RVFUZZ/DiveFuzz)
+- **去重**: `_seen_signatures`, `_seen_coverage_points` (粗粒度), `_seen_transitions` (细粒度)
+- **新增方法**:
+  - `snapshot()`: 返回 `_seen_coverage_points.copy()` — 快照隔离打分
+  - `preview_delta_from_snapshot(snapshot, transitions)`: 对比快照计算覆盖 delta
+  - `get_category_rarities()`: 按类别聚合 transition 稀有度均值
+- **持久化**: `dump_campaign_state()` 追加 `transition_keys_full` 全量保存
+- **恢复**: `bootstrap_from_campaign_state()` 从 `transition_keys_full` 完整恢复
 
-`CorpusEntry`: `{case_id, seed, status, failure_kind, signature, decision, queue, lineage_parent, manifest_path, coverage_*}`
-
-#### 6.7 fitness.py — 种子适应度
+#### 6.8 fitness.py — 种子适应度
 
 **SeedFitness**: `{seed, category_affinity, novelty_score, diff_diversity, exploration_score, lineage_depth}`
 
-**MUTATION_STRATEGIES** — 基于类别的块级变异策略:
+**FitnessCalculator** (已激活):
+- `evaluate()`: 计算类别亲和力、新颖性、diff 多样性、血统深度
+- `dominant_category()`: 返回新增转移最多的 CSR 类别 — 用于 `GoalDirectedScheduler.tag_seed()`
+- `update_lineage()`: 子代继承父代适应度 (EMA, α=0.3)
 
-| 策略 | 触发类别 | 动作 |
-|------|---------|------|
-| boost_memory | memory | 追加 LoadStoreBlock, AmoBlock (+30% ratio) |
-| boost_control | control | 追加 SystemOperationBlock, branch retarget |
-| boost_privilege | privilege | 追加 CsrBlock, 偏向 privilege CSRs |
-| boost_float | float | 追加 FloatArithmeticBlock |
-| boost_counter | counter | 追加 CsrBlock, 偏向 counter CSRs |
-| explore_crossover | (通用) | merge=True |
+**MUTATION_STRATEGIES**: 定义但未使用 (死代码)
 
-**FitnessCalculator**:
-- `evaluate()`: 计算类别亲和力 (new/total per category)、新颖性、diff 多样性
-- `update_lineage()`: 子代继承父代适应度 (EMA, α=0.3)，实现血统追踪
+### 7. fuzzer/executor/ — 执行层
 
-### 7. fuzzer/model/ — 数据模型
+**dut_executor.py**:
+- `_run_dut_tests_with_feedback()`: Manager-Worker 批量调度循环
+- `_run_dut_tests_original()`: 原始批处理 (完整保留)
+- `_build_bundle()`: WorkerResult → corpus-compatible dict
+- `_evaluate_and_enqueue()`: 单种子评分 + 入队 (warmup 和主循环共用)
 
-**MutationRequest** (request.py):
+**worker.py** (新建):
+- `worker_entry(task: WorkerTask) → WorkerResult`: ProcessPoolExecutor 入口
+- `worker_generate()`: 生成单种子, 直调 `process_file()` (避免嵌套线程池)
+- `worker_mutate()`: 变异某种子, 正确定位父 .S 文件
+- `worker_execute()`: subprocess.run emu, per-seed observe 隔离
+- `_setup_worker_singletons()`: spawn 模式兼容 (初始化 generator 单例)
+
+### 8. fuzzer/model/ — 数据模型
+
+**ExecuteResult** (result.py): 19 字段, 仅 6 个活跃使用 (其余为历史遗留):
 ```
-case_id, seed, coverage_new/total_points, coverage_delta_ratio,
-coverage_points, observation_counts, first_failure_event,
-seed_fitness, target_category, category_saturation
-```
-
-**ExecuteResult** (result.py):
-```
-case_id, status, exit_code, command, reference_name, duration_s,
-failure_kind, message, observation_path, observation_counts,
-observation_coverage_points, first_failure_event, observation_total_events,
-observation_max_cycle, observation_max_instr, observation_unique_pc_pages,
-csr_transitions, diff_families, sync_decisions, syncable_count, potential_bug_count
+case_id, status, csr_transitions, diff_families, syncable_count, potential_bug_count
 ```
 
-**MutationResult** (result.py):
-```
-case_id, status, next_seed, message
-```
+**MutationRequest / MutationResult** (request.py): 未使用, 死代码。
 
-### 8. fuzzer/tests/ — 测试
+### 9. fuzzer/tests/ — 测试
 
-`test_feedback_loop.py` — 22 个集成测试，7 个测试类:
+`test_feedback_loop.py` — 34 个集成测试, 10 个测试类:
 
 | 测试类 | 数量 | 覆盖 |
 |--------|------|------|
-| TestScheduler | 4 | pop 优先级, 去重, saturation boost, exhausted |
+| TestScheduler | 7 | push/pop 优先级, 去重, saturation boost, pop_best, dump/restore |
 | TestFeedbackSignals | 3 | 新覆盖信号, diff 增强, 零覆盖 |
 | TestDecisionPolicy | 3 | diff→bug_proximity, executed→stable, no_coverage→keep |
-| TestRunCorpus | 3 | record+dedup, dump/load, preview_coverage_delta |
-| TestSyncDecisionEngine | 4 | csr_write syncable, fp_rounding syncable, unknown bug, summary |
+| TestRunCorpus | 6 | record+dedup, dump/load, preview_coverage_delta, snapshot, delta_from_snapshot, rarities |
+| TestSyncDecisionEngine | 4 | csr_write, fp_rounding, unknown, summary |
 | TestObservation | 3 | empty inputs, DIFF_FAMILIES 7 族 |
-| TestStatusEnums | 2 | CaseStatus, FailureKind 枚举值 |
+| TestStatusEnums | 2 | CaseStatus, FailureKind |
+| TestFitnessCalculator | 4 | evaluate, lineage_parent, dominant_category, empty inputs |
+| TestSnapshotDelta | 2 | all_new, all_seen |
 
-### 9. configs/ — 反馈回路配置
+### 10. 持久化
 
-`rocket_feedback.yaml` — 完整示例:
-
-```yaml
-dut_target:
-  - name: rocket
-    emu_path: /path/to/rocket-chip
-    cmd: "SPIKE_HOME=... ./build/emu -i $1"
-    threads: 1
-    observe_path: "difftest.observe.jsonl"   # RVFUZZ 新增
-    observe_level: "all"                      # RVFUZZ 新增
-
-seeds:
-  - name: rocket-fb-test
-    input: divefuzz
-    divefuzz:
-      mode: generate
-      dive_enable: true         # XOR 去重
-      seeds_num: 1              # 每次迭代 1 个种子
-      ins_num: 200
-      template_type: rocket
-      architecture: rkt
-
-campaign_id: rocket-feedback-test   # RVFUZZ 新增
-batch_size: 10                      # RVFUZZ 新增 (循环迭代次数)
-corpus_max_retained: 100            # RVFUZZ 新增
-corpus_dir: /tmp/divefuzz-rocket-corpus  # RVFUZZ 新增 (跨 run 持久化)
+**campaign_state.json** (`dump_campaign_state()`):
+```json
+{
+  "coverage_points": ["privilege|csrrs", ...],
+  "transition_keys_full": [...],        // 全量, 消除有损恢复
+  "transition_frequency_sample": {...}, // 频率 top 1000 (调试用)
+  "diff_family_counts": {...},
+  "seed_fitness": {...},                // 运行时由 FitnessCalculator 填充
+  "signatures": [...],
+  "last_seed_id": N
+}
 ```
+
+**queue_state.json** (`scheduler.dump_queue()`):
+```json
+{
+  "bug_proximity": [{"seed_id": "...", "score": 0.95, "lineage_parent": "...", "action": "generate"}],
+  "stable_ancestor": [...],
+  "exploration": [...]
+}
+```
+
+**corpus_state.json** (`dump_state()`): 精简版, entries 列表 + 计数, 向后兼容。
 
 ---
 
 ## 反馈信号链路 (完整)
 
 ```
-DUT 执行
-  └─ observation JSONL (difftest.observe.jsonl)
-       ├─ extract_csr_transitions()
-       │    └─ 6 CSR 类别: privilege, float, control, memory, counter, misc
-       │         └─ RunCorpus.preview_transition_delta()
-       │              └─ 按类别: new/total + transition_rarity
-       │                   └─ exploration_value = Σ(weight × rarity × new/total)
+DUT 执行 (worker pool, M 个并行)
+  └─ observation JSONL (difftest.observe.{seed_id}.jsonl, per-seed 隔离)
+       ├─ parse_observation() → transitions + diff_families
        │
-       ├─ classify_diff_family()
-       │    └─ 7 diff 族: fp_rounding, fp_nan, csr_write, trap_difference,
-       │                  pc_divergence, memory_ordering, unknown
-       │         └─ diff_novelty_score → exploration_value 加成
+       ├─ [snapshot 隔离] corpus.preview_delta_from_snapshot(snapshot, transitions)
+       │    └─ make_coverage_key() → {category}|{mnemonic} (粗粒度)
+       │         └─ by_category: {cat: {new, total}}
        │
-       └─ SyncDecisionEngine.classify()
-            └─ syncable / potential_bug 判定 (13 条规则)
-                 └─ FeedbackDecisionPolicy.decide()
-                      ├─ DIFF/REF/BADTRAP/TIMEOUT → promote_mutation (bug_proximity)
-                      ├─ EXECUTED + 新覆盖         → promote_mutation (stable_ancestor)
-                      ├─ EXECUTED + 无新覆盖       → keep_in_corpus (exploration)
-                      └─ 签名重复                  → archive_only (dedup)
+       ├─ corpus.preview_diff_delta(diff_families)
+       │    └─ diff_novelty = new_families / total_families
+       │
+       ├─ SyncDecisionEngine.classify(diff_events)
+       │    └─ syncable_count / potential_bug_count
+       │
+       ├─ FeedbackSignalExtractor.extract()
+       │    └─ exploration_value = Σ(weight × rarity × new/total)
+       │         └─ rarity 来自 corpus.get_category_rarities() (已激活)
+       │
+       ├─ FitnessCalculator.evaluate()
+       │    ├─ category_affinity → GoalDirectedScheduler.tag_seed()
+       │    ├─ lineage_depth → 追踪血统
+       │    └─ corpus.update_seed_fitness()
+       │
+       ├─ FeedbackDecisionPolicy.decide()
+       │    ├─ promote_mutation → push 原种子 + push 变异种子 (action="mutate")
+       │    ├─ keep_in_corpus  → push (exploration)
+       │    └─ archive_only → 不入队
+       │
+       └─ persist: campaign_state.json + queue_state.json
 ```
 
 ---
 
-## 依赖
+## 运行
 
-| 依赖 | 用途 |
-|------|------|
-| Spike (riscv-isa-sim-adapter) | 运行时值 XOR 去重 + 指令验证 |
-| riscv64-unknown-elf-* | 汇编/链接/objcopy |
-| pybind11 ~=3.0.1 | Python-C++ 桥接 |
-| PyYAML ~=5.4.1 | YAML 配置解析 |
-| numpy ~=2.2.4 | 概率分布, Z-score |
+```bash
+# 从仓库根目录运行 (所有导入使用 fuzzer. 前缀)
+PYTHONPATH=. python fuzzer/run_dut.py --config configs/rocket_feedback.yaml
+```
 
----
+## 测试
 
-## 与 RVFUZZ 的差异
-
-### 原始 DiveFuzz vs RVFUZZ
-
-| 特性 | DiveFuzz (原始) | RVFUZZ (原) |
-|------|----------|-------------|
-| 指令生成 | 平坦序列, 随机扩展→指令 | CSP 求解 + Block 结构 |
-| 多样性保证 | Spike 运行时值 XOR (深) | 寄存器编号 XOR (浅) |
-| 反馈回路 | 无 (一次性管道) | 完整闭环 (Scheduler→Signal→Decision→Mutation) |
-| 变异 | 指令级 (频率统计 + Z-score) | Block 级 (追加 block 类型) |
-| 覆盖率 | 无 | CSR 转移 (5+1 类) + Diff 族 (7 类) |
-| 程序结构 | 平坦指令 + 模板 header/footer | Block 语义容器 |
-| DUT 支持 | 多 CPU (XS/NTS/RKT/CVA6/BOOM) | Rocket only |
-
-### 当前 DiveFuzz (植入后) vs RVFUZZ
-
-| 特性 | DiveFuzz (当前) | RVFUZZ (原) |
-|------|----------|-------------|
-| 指令生成 | 平坦序列 + XOR 去重 (保留) | CSP 求解 + Block 结构 |
-| 多样性保证 | Spike 运行时值 XOR (深, 保留) | 寄存器编号 XOR (浅) |
-| 反馈回路 | **有** (RVFUZZ 植入: Scheduler→Signal→Decision→Mutation) | 完整闭环 |
-| 变异 | 指令级 (Z-score, 保留) + **Block 策略指导** (fitness.py) | Block 级 |
-| 覆盖率 | **有** (CSR 转移 6 类 + Diff 族 7 类) | CSR 转移 6 类 + Diff 族 7 类 |
-| 程序结构 | 平坦指令 + 模板 | Block 语义容器 |
-| DUT 支持 | 多 CPU + **Rocket 反馈回路** | Rocket only |
-| 调度器 | GoalDirectedScheduler (三队列 + 饱和度 Boost) | GoalDirectedScheduler |
-| 持久化 | RunCorpus.dump_state / dump_campaign_state | 类似 |
-| 测试 | 22 个集成测试 | 同 |
-
-**关键差异保留:** DiveFuzz 的生成器（Spike XOR 去重、HybridEncoder、BugFilter、多 CPU 模板系统）全部保持不变。RVFUZZ 植入仅在外层控制流和反馈组件层面。DiveFuzz 的指令级变异仍为主变异机制，fitness.py 中的 Block 策略目前作为配置指导。
-
----
-
-## 兼容性
-
-- `run_dut_tests(config, config_filename)` — 不传 feedback 参数 → 原始批处理行为
-- `run_dut_tests(config, config_filename, feedback={...})` — 启用反馈回路
-- 所有原始 YAML 配置文件无需修改即可使用 (新增字段均有默认值)
-- 原始 `_run_dut_tests_original()` 完整保留
-- 反馈组件 (core/) 独立于生成器，不修改 DiveFuzz 原装代码
+```bash
+PYTHONPATH=. python -m pytest fuzzer/tests/test_feedback_loop.py -v
+```
