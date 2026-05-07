@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from generator.asm_template_manager.riscv_asm_syntex import ArchConfig
 
 
 @dataclass
@@ -25,7 +28,7 @@ class WorkerTask:
     output_dir: Path
     emu_cmd: str
     emu_path: str
-    arch: Any                 # ArchConfig (picklable dataclass from generator)
+    arch: ArchConfig                 # picklable dataclass from generator
     instr_number: int = 200
     template_type: str = "rocket"
     architecture: str = "rkt"
