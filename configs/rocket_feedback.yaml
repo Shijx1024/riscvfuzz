@@ -14,7 +14,7 @@ dut_target:
     diff_ref: "spike"
     emu_path: /home/shijunxu/riscwuzz/RVFUZZ/learn/DiveFuzz/dut/rocket-chip
     cmd: "SPIKE_HOME=/home/shijunxu/riscwuzz/RVFUZZ/ref/riscv-isa-sim ./build/emu -i $1"
-    threads: 2
+    threads: 1
     # RVFUZZ feedback: observer output path (relative to emu_path)
     observe_path: "difftest.observe.jsonl"
     observe_level: "all"
@@ -39,13 +39,13 @@ seeds:
       allowed_ext_name: base
       # Single seed per iteration (feedback loop controls total count)
       seeds_num: 1
-      ins_num: 500
+      ins_num: 200
       is_rv32: false
 
 # --- RVFUZZ Feedback Loop ---
 campaign_id: rocket-feedback-test
 # Total iterations (each iteration: scheduler.pop → generate → execute → observe → decide → mutate)
-batch_size: 3
+batch_size: 10
 # Maximum seeds retained in RunCorpus
 corpus_max_retained: 100
 # Cross-run persistence directory

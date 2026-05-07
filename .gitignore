@@ -14,4 +14,4 @@ fuzzer/build
 .vscode
 fuzzer/*.yaml
 outputs
-.txt
+.txt.claude/worktrees/
