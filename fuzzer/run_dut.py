@@ -19,9 +19,9 @@ from pathlib import Path
 from config.logger_config import get_global_logger, create_output_dir
 from config.dut_config import Config
 from executor.dut_executor import run_dut_tests
-from fuzzer.core.corpus import RunCorpus
-from fuzzer.core.scheduler import GoalDirectedScheduler
-from fuzzer.core.feedback_loop import FeedbackSignalExtractor, FeedbackDecisionPolicy
+from core.corpus import RunCorpus
+from core.scheduler import GoalDirectedScheduler
+from core.feedback_loop import FeedbackSignalExtractor, FeedbackDecisionPolicy
 
 
 def main():
@@ -43,6 +43,26 @@ def main():
         signal_extractor = FeedbackSignalExtractor()
         decision_policy = FeedbackDecisionPolicy()
 
+        # [RVFUZZ P0.1] Restore campaign state from previous run
+        corpus_dir = Path(config.corpus_dir) if config.corpus_dir else Path("outputs")
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        campaign_state_path = corpus_dir / "campaign_state.json"
+        if campaign_state_path.exists():
+            prev_state = RunCorpus.load_campaign_state(campaign_state_path)
+            if prev_state:
+                corpus.bootstrap_from_campaign_state(prev_state)
+                global_logger.info(
+                    f"Restored campaign state: "
+                    f"{prev_state.get('signature_count', 0)} signatures, "
+                    f"{prev_state.get('coverage_point_count', 0)} coverage points"
+                )
+
+        # [RVFUZZ P0.2] Restore queue state from previous run
+        queue_state_path = corpus_dir / "queue_state.json"
+        if queue_state_path.exists():
+            scheduler.restore(queue_state_path)
+            global_logger.info(f"Restored queue state with {len(scheduler)} seeds")
+
         # run tests with feedback loop
         run_dut_tests(config, args.config, feedback={
             "corpus": corpus,
@@ -51,16 +71,18 @@ def main():
             "decision_policy": decision_policy,
         })
 
-        # [RVFUZZ P8] Persist corpus state
+        # [RVFUZZ P8] Persist corpus state (campaign-level: includes coverage points, transitions, frequencies)
         corpus_dir = Path(config.corpus_dir) if config.corpus_dir else Path("outputs")
         corpus_dir.mkdir(parents=True, exist_ok=True)
+        corpus.dump_campaign_state(corpus_dir / "campaign_state.json")
         corpus.dump_state(corpus_dir / "corpus_state.json")
-        global_logger.info(f"Corpus state saved to {corpus_dir / 'corpus_state.json'}")
+        scheduler.dump_queue(corpus_dir / "queue_state.json")
+        global_logger.info(f"Queue state saved to {corpus_dir / 'queue_state.json'}")
+        global_logger.info(f"Campaign state saved to {corpus_dir / 'campaign_state.json'}")
 
     except FileNotFoundError as e:
         global_logger.error(f"Config file not found: {e}")
         return 1
 
 if __name__ == "__main__":
-    # sys.exit(main())
-    main()
+    sys.exit(main())
