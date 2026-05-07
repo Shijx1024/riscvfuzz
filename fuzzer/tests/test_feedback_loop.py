@@ -420,3 +420,89 @@ class TestStatusEnums:
         assert FailureKind.BAD_TRAP.value == "bad_trap"
         assert FailureKind.INFRA_ERROR.value == "infra_error"
         assert FailureKind.TIMEOUT.value == "timeout"
+
+
+class TestFitnessCalculator:
+    def test_evaluate_with_coverage(self):
+        from fuzzer.core.fitness import FitnessCalculator, SeedFitness
+        calc = FitnessCalculator()
+        category_deltas = {
+            "privilege": {"new": 2, "total": 3},
+            "float": {"new": 0, "total": 0},
+            "control": {"new": 1, "total": 2},
+        }
+        fitness = calc.evaluate(
+            seed="test_seed",
+            category_deltas=category_deltas,
+            diff_families=["fp_rounding"],
+            exploration_value=0.75,
+        )
+        assert fitness.exploration_score == 0.75
+        assert fitness.diff_diversity == 1
+        assert fitness.lineage_depth == 0
+        assert fitness.category_affinity["privilege"] > 0
+        assert fitness.category_affinity["float"] == 0.0
+
+    def test_evaluate_with_parent_lineage(self):
+        from fuzzer.core.fitness import FitnessCalculator, SeedFitness
+        calc = FitnessCalculator()
+        parent = SeedFitness(
+            seed="p1", category_affinity={"privilege": 0.8},
+            novelty_score=5.0, diff_diversity=2.0,
+            exploration_score=0.6, lineage_depth=3,
+        )
+        fitness = calc.evaluate(
+            seed="child_seed",
+            category_deltas={"privilege": {"new": 3, "total": 5}},
+            diff_families=["csr_write"],
+            exploration_value=0.9,
+            lineage_depth=parent.lineage_depth + 1,
+        )
+        assert fitness.lineage_depth == 4
+
+    def test_dominant_category(self):
+        from fuzzer.core.fitness import FitnessCalculator
+        calc = FitnessCalculator()
+        cat = calc.dominant_category({
+            "privilege": {"new": 1, "total": 5},
+            "memory": {"new": 4, "total": 6},
+        })
+        assert cat == "memory"
+
+    def test_evaluate_empty_inputs(self):
+        from fuzzer.core.fitness import FitnessCalculator
+        calc = FitnessCalculator()
+        fitness = calc.evaluate(
+            seed="empty",
+            category_deltas={},
+            diff_families=[],
+            exploration_value=0.0,
+        )
+        assert fitness.novelty_score == 0.0
+        assert fitness.diff_diversity == 0.0
+
+
+class TestSnapshotDelta:
+    def test_snapshot_delta_all_new(self):
+        from fuzzer.core.corpus import RunCorpus
+        corpus = RunCorpus()
+        snap = corpus.snapshot()
+        transitions = [
+            {"csr": "privilege", "prev_value": "a", "curr_value": "b",
+             "instr": "csrrs:0x342", "category": "privilege"},
+        ]
+        delta = corpus.preview_delta_from_snapshot(snap, transitions)
+        assert delta["new_coverage"] == 1
+        assert delta["total_coverage"] == 1
+
+    def test_snapshot_delta_all_seen(self):
+        from fuzzer.core.corpus import RunCorpus
+        corpus = RunCorpus()
+        corpus._seen_coverage_points.add("privilege|csrrs")
+        snap = corpus.snapshot()
+        transitions = [
+            {"csr": "privilege", "prev_value": "a", "curr_value": "b",
+             "instr": "csrrs:0x342", "category": "privilege"},
+        ]
+        delta = corpus.preview_delta_from_snapshot(snap, transitions)
+        assert delta["new_coverage"] == 0
