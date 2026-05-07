@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import heapq
+import json
+import math
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -77,8 +79,6 @@ class MultiQueueScheduler:
 
     def dump_queue(self, path: Path) -> None:
         """Persist queue state to JSON file (atomic write via tmp + replace)."""
-        import json
-
         payload = {}
         for name in self._QUEUE_ORDER:
             items = []
@@ -96,8 +96,6 @@ class MultiQueueScheduler:
 
     def restore(self, path: Path) -> None:
         """Restore queue state from JSON file."""
-        import json
-
         if not path.exists():
             return
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -116,8 +114,6 @@ class MultiQueueScheduler:
                     heapq.heappush(self._queues[name], ref)
                 self._seen_seeds.add(ref.seed_id)
 
-
-import math
 
 
 class GoalDirectedScheduler(MultiQueueScheduler):
