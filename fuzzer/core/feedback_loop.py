@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fuzzer.core.status import CaseStatus
+from core.status import CaseStatus
 
 CATEGORY_WEIGHTS: dict[str, float] = {
     "privilege": 1.0,
@@ -20,7 +20,6 @@ class FeedbackSignals:
     failure_kind: str | None
     coverage_new_points: int
     coverage_total_points: int
-    duration_s: float
     exploration_value: float
     diff_novelty_score: float = 0.0
     syncable_count: int = 0
@@ -41,7 +40,6 @@ class FeedbackSignalExtractor:
         failure_kind: str | None,
         coverage_new_points: int,
         coverage_total_points: int,
-        duration_s: float,
         category_deltas: dict[str, dict[str, int]] | None = None,
         transition_rarities: dict[str, float] | None = None,
         diff_novelty_score: float = 0.0,
@@ -53,10 +51,10 @@ class FeedbackSignalExtractor:
             for cat, delta in category_deltas.items():
                 weight = CATEGORY_WEIGHTS.get(cat, 0.3)
                 total_weight += weight
-                if delta["total"] > 0:
+                if delta.get("total", 0) > 0:
                     rarity = (transition_rarities or {}).get(cat, 1.0)
                     exploration_value += (
-                        weight * rarity * (delta["new"] / float(delta["total"]))
+                        weight * rarity * (delta.get("new", 0) / float(delta["total"]))
                     )
             if total_weight > 0:
                 exploration_value = min(1.0, exploration_value / total_weight)
@@ -76,7 +74,6 @@ class FeedbackSignalExtractor:
             failure_kind=failure_kind,
             coverage_new_points=coverage_new_points,
             coverage_total_points=coverage_total_points,
-            duration_s=duration_s,
             exploration_value=exploration_value,
             diff_novelty_score=diff_novelty_score,
             syncable_count=syncable_count,
